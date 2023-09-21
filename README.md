@@ -1,16 +1,19 @@
+# tymigrawr!
+
 <div align="center">
   <h1>
     <img src="logo.png" alt="tymigrawr!" />
   </h1>
 </div>
 
-> Ah, my dear interlocutors, disregarding the prudent guardianship of data migrations
-> is akin to unchaining a T-Rex upon our society, foretelling a realm of disorder
-> and desolation.
+> "Clever as Dr. Ian Malcolm himself, remember that neglecting the intricate
+> dance of data evolution in your modeling can turn your once-orderly systems
+> into chaotic, dino-sized debacles, leaving you wishing for a T-Rex-sized
+> umbrella!"
 >
-> -- Not quite Socrates
-
-# tymigrawr!
+> -- Chat GPT after much cajolling, seemingly implying that a shit storm of
+>    pain awaits you and your teamates in the event you misrepresent the
+>    evolution of your program's data over time.
 
 We often think of our current data types as the truth of our program,
 disregarding previous attempts at modeling our domain.
