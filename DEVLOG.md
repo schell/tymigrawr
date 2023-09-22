@@ -1,5 +1,14 @@
 # Devlog / Notes
 
+## Sep 22 2023
+
+### CRUD
+
+The crud stuff isn't so bad. It's mostly taken care of by having types
+implement a trait `CrudFields`, which provides the bulk of serialization /
+deserialization. Implementing this trait could easily be turned into a derive
+macro.
+
 ## Sep 21 2023
 
 ### CRUD
