@@ -1,5 +1,12 @@
 # Devlog / Notes
 
+## Sep 24 2023
+
+### Multiple Connections
+
+I'm working on adding support for migrating w/ multiple connections. That way
+folks can migrate between tables/backends.
+
 ## Sep 23 2023
 
 ### Multiple Backends

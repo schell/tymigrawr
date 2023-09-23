@@ -361,7 +361,8 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
             .iter()
             .map(|field| field.name)
             .collect::<Vec<_>>();
-        let statement = format!("SELECT * FROM {table_name} WHERE {key_name} {comparison} :key_value");
+        let statement =
+            format!("SELECT * FROM {table_name} WHERE {key_name} {comparison} :key_value");
         let mut query = connection
             .prepare(statement)
             .whatever_context("create prepare")?;
@@ -382,9 +383,9 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
         Ok(Box::new(cursor))
     }
 
-    fn read<'a, Key: IsCrudField> (
+    fn read<'a, Key: IsCrudField>(
         connection: &'a sqlite::Connection,
-        key: Key
+        key: Key,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
         Self::read_where(connection, Self::primary_key_name(), "=", key)
     }
@@ -501,8 +502,8 @@ pub struct Migrations<T> {
     all: VecDeque<Migration>,
 }
 
-impl<T: HasCrudFields + Clone + Sized + 'static> Default for Migrations<T> {
-    fn default() -> Self {
+impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
+    pub fn default() -> Self {
         Self {
             _current: PhantomData,
             all: Default::default(),
@@ -527,7 +528,14 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
         }
     }
 
-    pub fn run(self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
+    pub fn run<'a>(self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
+        self.run_with(|_| connection)
+    }
+
+    pub fn run_with<'a>(
+        self,
+        mk_connection: impl Fn(&str) -> &'a sqlite::Connection,
+    ) -> Result<(), snafu::Whatever> {
         let Self { _current, mut all } = self;
         log::info!(
             "migrating {} versions of {:?}",
@@ -543,7 +551,11 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
             let fields = (migration.crud_fields)();
             let column_names = fields.iter().map(|f| f.name).collect::<Vec<_>>();
             // Get a cursor of each value in the prev table
-            let cursor = read_all_values(connection, prev_table_name, column_names)?;
+            let cursor = read_all_values(
+                (mk_connection)(prev_table_name),
+                prev_table_name,
+                column_names,
+            )?;
             let mut current_table_name = prev_table_name;
             let mut entries = 0;
             for res_prev in cursor {
@@ -564,7 +576,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
                 // Save it in the most current table, if need be.
                 if current_table_name != prev_table_name {
                     let fields = (last_migration.as_crud_fields)(&current);
-                    insert_fields(connection, current_table_name, &fields)?;
+                    insert_fields((mk_connection)(current_table_name), current_table_name, &fields)?;
                 }
             }
             log::info!("    migrated {entries} entries from {prev_table_name}",);
@@ -572,7 +584,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
             if current_table_name != prev_table_name {
                 log::info!("    clearing out previous table {prev_table_name}");
                 let statement = format!("DELETE FROM {prev_table_name};");
-                let mut query = connection
+                    let mut query = (mk_connection)(prev_table_name)
                     .prepare(&statement)
                     .whatever_context("prepare clear table")?;
                 while let Ok(_) = query.next() {}
@@ -744,10 +756,14 @@ mod test {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("data.db");
         let connection = sqlite::open(path).unwrap();
+        let path = tempdir.path().join("data_v3.db");
+        let connection_v3 = sqlite::open(path).unwrap();
+        log::debug!("creating tables");
         PlayerV1::create(&connection).unwrap();
         PlayerV2::create(&connection).unwrap();
-        PlayerV3::create(&connection).unwrap();
+        PlayerV3::create(&connection_v3).unwrap();
 
+        log::debug!("populating v1");
         let players_v1 = (0..100)
             .map(|i| PlayerV1 {
                 id: i,
@@ -768,7 +784,12 @@ mod test {
         let migrations = Migrations::<PlayerV1>::default()
             .with_version::<PlayerV2>()
             .with_version::<Player>();
-        migrations.run(&connection).unwrap();
+        migrations
+            .run_with(|table| match table {
+                "playerv3" => &connection_v3,
+                _ => &connection,
+            })
+            .unwrap();
 
         let players_v1_from_db = PlayerV1::read_all(&connection)
             .unwrap()
@@ -776,7 +797,7 @@ mod test {
             .collect::<Vec<_>>();
         assert_eq!(Vec::<PlayerV1>::new(), players_v1_from_db);
 
-        let players_v3_from_db = PlayerV3::read_all(&connection)
+        let players_v3_from_db = PlayerV3::read_all(&connection_v3)
             .unwrap()
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
@@ -786,7 +807,12 @@ mod test {
         let migrations = Migrations::<Player>::default()
             .with_version::<PlayerV2>()
             .with_version::<PlayerV1>();
-        migrations.run(&connection).unwrap();
+        migrations
+            .run_with(|table| match table {
+                "playerv3" => &connection_v3,
+                _ => &connection,
+            })
+            .unwrap();
         let players_v1_from_db = PlayerV1::read_all(&connection)
             .unwrap()
             .map(|r| r.unwrap())
