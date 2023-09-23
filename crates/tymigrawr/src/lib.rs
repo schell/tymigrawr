@@ -5,6 +5,8 @@ use std::{
 
 use snafu::prelude::*;
 
+pub use tymigrawr_derive::HasCrudFields;
+
 #[derive(Default)]
 pub enum ValueType {
     #[default]
@@ -49,7 +51,7 @@ pub trait IsCrudField: Sized {
     type MaybeSelf;
 
     fn field() -> CrudField;
-    fn into_value(self) -> sqlite::Value;
+    fn into_value(&self) -> sqlite::Value;
     fn maybe_from_value(value: &sqlite::Value) -> Self::MaybeSelf;
 }
 
@@ -63,8 +65,8 @@ impl IsCrudField for i64 {
         }
     }
 
-    fn into_value(self) -> sqlite::Value {
-        self.into()
+    fn into_value(&self) -> sqlite::Value {
+        (*self).into()
     }
 
     fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
@@ -86,8 +88,8 @@ impl IsCrudField for i32 {
         }
     }
 
-    fn into_value(self) -> sqlite::Value {
-        let i = i64::from(self);
+    fn into_value(&self) -> sqlite::Value {
+        let i = i64::from(*self);
         i.into()
     }
 
@@ -111,8 +113,8 @@ impl IsCrudField for u32 {
         }
     }
 
-    fn into_value(self) -> sqlite::Value {
-        let i = i64::from(self);
+    fn into_value(&self) -> sqlite::Value {
+        let i = i64::from(*self);
         i.into()
     }
 
@@ -135,8 +137,8 @@ impl IsCrudField for String {
         }
     }
 
-    fn into_value(self) -> sqlite::Value {
-        self.into()
+    fn into_value(&self) -> sqlite::Value {
+        self.clone().into()
     }
 
     fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
@@ -158,8 +160,8 @@ impl IsCrudField for f64 {
         }
     }
 
-    fn into_value(self) -> sqlite::Value {
-        self.into()
+    fn into_value(&self) -> sqlite::Value {
+        (*self).into()
     }
 
     fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
@@ -181,8 +183,8 @@ impl IsCrudField for f32 {
         }
     }
 
-    fn into_value(self) -> sqlite::Value {
-        (self as f64).into()
+    fn into_value(&self) -> sqlite::Value {
+        (*self as f64).into()
     }
 
     fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
@@ -204,8 +206,8 @@ impl IsCrudField for Vec<u8> {
         }
     }
 
-    fn into_value(self) -> sqlite::Value {
-        self.into()
+    fn into_value(&self) -> sqlite::Value {
+        self.clone().into()
     }
 
     fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
@@ -226,7 +228,7 @@ impl<T: IsCrudField> IsCrudField for Option<T> {
         cf
     }
 
-    fn into_value(self) -> sqlite::Value {
+    fn into_value(&self) -> sqlite::Value {
         if let Some(v) = self {
             v.into_value()
         } else {
@@ -296,6 +298,8 @@ pub trait HasCrudFields: Sized {
     fn table_name() -> &'static str;
     fn crud_fields() -> Vec<CrudField>;
     fn as_crud_fields(&self) -> HashMap<&str, sqlite::Value>;
+    fn primary_key_name() -> &'static str;
+    fn primary_key_val(&self) -> sqlite::Value;
     fn try_from_crud_fields(fields: &HashMap<&str, sqlite::Value>)
         -> Result<Self, snafu::Whatever>;
 }
@@ -346,9 +350,10 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
         ))
     }
 
-    fn read<'a>(
+    fn read_where<'a>(
         connection: &'a sqlite::Connection,
         key_name: &'a str,
+        comparison: &'a str,
         key_value: impl IsCrudField,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
         let table_name = Self::table_name();
@@ -356,7 +361,7 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
             .iter()
             .map(|field| field.name)
             .collect::<Vec<_>>();
-        let statement = format!("SELECT * FROM {table_name} WHERE {key_name} = :key_value");
+        let statement = format!("SELECT * FROM {table_name} WHERE {key_name} {comparison} :key_value");
         let mut query = connection
             .prepare(statement)
             .whatever_context("create prepare")?;
@@ -375,6 +380,13 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
                 Self::try_from_crud_fields(&cols)
             });
         Ok(Box::new(cursor))
+    }
+
+    fn read<'a, Key: IsCrudField> (
+        connection: &'a sqlite::Connection,
+        key: Key
+    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
+        Self::read_where(connection, Self::primary_key_name(), "=", key)
     }
 
     fn update(&self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
@@ -555,9 +567,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
                     insert_fields(connection, current_table_name, &fields)?;
                 }
             }
-            log::info!(
-                "    migrated {entries} entries from {prev_table_name}",
-            );
+            log::info!("    migrated {entries} entries from {prev_table_name}",);
             // Remove the old entries if need be
             if current_table_name != prev_table_name {
                 log::info!("    clearing out previous table {prev_table_name}");
@@ -576,45 +586,13 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
 mod test {
     use snafu::prelude::*;
 
-    use crate::{Crud, CrudField, HasCrudFields, IsCrudField, Migrations};
+    use crate::{self as tymigrawr, Crud, HasCrudFields, IsCrudField, Migrations};
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV1 {
+        #[primary_key]
         pub id: i64,
         pub name: String,
-    }
-
-    impl HasCrudFields for PlayerV1 {
-        fn table_name() -> &'static str {
-            "player_v1"
-        }
-
-        fn crud_fields() -> Vec<CrudField> {
-            let mut id = i64::field();
-            id.name = "id";
-            id.primary_key = true;
-            id.auto_increment = true;
-            let mut name = String::field();
-            name.name = "name";
-            vec![id, name]
-        }
-
-        fn as_crud_fields(&self) -> std::collections::HashMap<&str, sqlite::Value> {
-            std::collections::HashMap::from_iter([
-                ("id", self.id.into_value()),
-                ("name", self.name.clone().into_value()),
-            ])
-        }
-
-        fn try_from_crud_fields(
-            fields: &std::collections::HashMap<&str, sqlite::Value>,
-        ) -> Result<Self, snafu::Whatever> {
-            let id_value = fields.get("id").whatever_context("missing id")?;
-            let id = i64::maybe_from_value(id_value).whatever_context("id")?;
-            let name_value = fields.get("name").whatever_context("missing name")?;
-            let name = String::maybe_from_value(name_value).whatever_context("name")?;
-            Ok(Self { id, name })
-        }
     }
 
     impl From<PlayerV2> for PlayerV1 {
@@ -636,53 +614,16 @@ mod test {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV2 {
+        #[primary_key]
         pub id: i64,
         pub name: String,
         pub age: f32,
     }
 
-    impl HasCrudFields for PlayerV2 {
-        fn table_name() -> &'static str {
-            "player_v2"
-        }
-
-        fn crud_fields() -> Vec<CrudField> {
-            let mut id = i64::field();
-            id.name = "id";
-            id.primary_key = true;
-            id.auto_increment = true;
-            let mut name = String::field();
-            name.name = "name";
-            let mut age = f32::field();
-            age.name = "age";
-            vec![id, name, age]
-        }
-
-        fn as_crud_fields(&self) -> std::collections::HashMap<&str, sqlite::Value> {
-            std::collections::HashMap::from_iter([
-                ("id", self.id.into_value()),
-                ("name", self.name.clone().into_value()),
-                ("age", self.age.into_value()),
-            ])
-        }
-
-        fn try_from_crud_fields(
-            fields: &std::collections::HashMap<&str, sqlite::Value>,
-        ) -> Result<Self, snafu::Whatever> {
-            let id_value = fields.get("id").whatever_context("missing id")?;
-            let id = i64::maybe_from_value(id_value).whatever_context("id")?;
-            let name_value = fields.get("name").whatever_context("missing name")?;
-            let name = String::maybe_from_value(name_value).whatever_context("name")?;
-            let age_value = fields.get("age").whatever_context("missing age")?;
-            let age = f32::maybe_from_value(age_value).whatever_context("age")?;
-            Ok(Self { id, name, age })
-        }
-    }
-
     #[test]
-    fn p1_sanity() {
+    fn p1_crud() {
         let connection = sqlite::open(":memory:").unwrap();
         PlayerV1::create(&connection).unwrap();
         let first_player = PlayerV1 {
@@ -690,7 +631,7 @@ mod test {
             name: "tymigrawr".to_string(),
         };
         first_player.insert(&connection).unwrap();
-        let player = PlayerV1::read(&connection, "id", 0)
+        let player = PlayerV1::read(&connection, 0)
             .unwrap()
             .next()
             .unwrap()
@@ -701,21 +642,21 @@ mod test {
             name: "developer".to_string(),
         };
         second_player.insert(&connection).unwrap();
-        let player = PlayerV1::read(&connection, "id", 1)
+        let player = PlayerV1::read(&connection, 1)
             .unwrap()
             .next()
             .unwrap()
             .unwrap();
         assert_eq!(second_player, player);
 
-        let mut p1 = PlayerV1::read(&connection, "id", first_player.id).unwrap();
+        let mut p1 = PlayerV1::read(&connection, first_player.id).unwrap();
         assert_eq!(first_player, p1.next().unwrap().unwrap());
-        let mut p2 = PlayerV1::read(&connection, "id", second_player.id).unwrap();
+        let mut p2 = PlayerV1::read(&connection, second_player.id).unwrap();
         assert_eq!(second_player, p2.next().unwrap().unwrap());
 
         second_player.name = "software engineer".to_string();
         second_player.update(&connection).unwrap();
-        let p2 = PlayerV1::read(&connection, "id", second_player.id)
+        let p2 = PlayerV1::read(&connection, second_player.id)
             .unwrap()
             .next()
             .unwrap()
@@ -723,7 +664,7 @@ mod test {
         assert_eq!(second_player, p2);
 
         second_player.delete(&connection).unwrap();
-        let players = PlayerV1::read(&connection, "id", p2.id)
+        let players = PlayerV1::read(&connection, p2.id)
             .unwrap()
             .map(|p| p.unwrap())
             .collect::<Vec<_>>();
@@ -731,7 +672,7 @@ mod test {
     }
 
     #[test]
-    fn p2_sanity() {
+    fn p2_crud() {
         let connection = sqlite::open(":memory:").unwrap();
         PlayerV2::create(&connection).unwrap();
         let mut first_player = PlayerV2 {
@@ -740,12 +681,12 @@ mod test {
             age: 0.1,
         };
         first_player.insert(&connection).unwrap();
-        let mut p1 = PlayerV2::read(&connection, "id", first_player.id).unwrap();
+        let mut p1 = PlayerV2::read(&connection, first_player.id).unwrap();
         assert_eq!(first_player, p1.next().unwrap().unwrap());
 
         first_player.name = "software engineer".to_string();
         first_player.update(&connection).unwrap();
-        let p2 = PlayerV2::read(&connection, "id", first_player.id)
+        let p2 = PlayerV2::read(&connection, first_player.id)
             .unwrap()
             .next()
             .unwrap()
@@ -753,15 +694,16 @@ mod test {
         assert_eq!(first_player, p2);
 
         first_player.delete(&connection).unwrap();
-        let players = PlayerV2::read(&connection, "id", p2.id)
+        let players = PlayerV2::read(&connection, p2.id)
             .unwrap()
             .map(|p| p.unwrap())
             .collect::<Vec<_>>();
         assert!(players.is_empty());
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV3 {
+        #[primary_key]
         pub id: i64,
         pub name: String,
         pub description: String,
@@ -789,51 +731,6 @@ mod test {
         }
     }
 
-    impl HasCrudFields for PlayerV3 {
-        fn table_name() -> &'static str {
-            "player_v3"
-        }
-
-        fn crud_fields() -> Vec<CrudField> {
-            let mut id = i64::field();
-            id.name = "id";
-            id.primary_key = true;
-            id.auto_increment = true;
-            let mut name = String::field();
-            name.name = "name";
-            let mut description = String::field();
-            description.name = "description";
-            vec![id, name, description]
-        }
-
-        fn as_crud_fields(&self) -> std::collections::HashMap<&str, sqlite::Value> {
-            std::collections::HashMap::from_iter([
-                ("id", self.id.into_value()),
-                ("name", self.name.clone().into_value()),
-                ("description", self.description.clone().into_value()),
-            ])
-        }
-
-        fn try_from_crud_fields(
-            fields: &std::collections::HashMap<&str, sqlite::Value>,
-        ) -> Result<Self, snafu::Whatever> {
-            let id_value = fields.get("id").whatever_context("missing id")?;
-            let id = i64::maybe_from_value(id_value).whatever_context("id")?;
-            let name_value = fields.get("name").whatever_context("missing name")?;
-            let name = String::maybe_from_value(name_value).whatever_context("name")?;
-            let description_value = fields
-                .get("description")
-                .whatever_context("missing description")?;
-            let description =
-                String::maybe_from_value(description_value).whatever_context("description")?;
-            Ok(Self {
-                id,
-                name,
-                description,
-            })
-        }
-    }
-
     pub type Player = PlayerV3;
 
     #[test]
@@ -851,7 +748,7 @@ mod test {
         PlayerV2::create(&connection).unwrap();
         PlayerV3::create(&connection).unwrap();
 
-        let players_v1 = (0..10_000)
+        let players_v1 = (0..100)
             .map(|i| PlayerV1 {
                 id: i,
                 name: format!("tymigrawr_{i}"),

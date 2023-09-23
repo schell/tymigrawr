@@ -2,11 +2,6 @@
 
 ## Sep 23 2023
 
-### It Works!
-
-Forward and reverse migrations are working like a charm and are relatively
-snappy when writing to disk via sqlite3 even without any optimisation.
-
 ### Multiple Backends
 
 I'm dropping support for autoincrementing keys, at least for now. I like the
@@ -21,6 +16,21 @@ could be one of the bigger "selling" points of the library.
 
 Anyway - I'm still proving the initial theory that we can make migrations easy
 and do them in Rust and it would kill some pain.
+
+### It Works!
+
+Forward and reverse migrations are working like a charm and are relatively
+snappy when writing to disk via sqlite3 even without any optimisation.
+
+### Next up
+
+Next I think I'll work on allowing each version to access its own connection,
+that way we could migrate between databases / backends.
+
+### Nevermind
+
+I ended up adding a derive macro for `HasCrudFields`. It really cuts down on
+the boilerplate!
 
 ## Sep 22 2023
 
