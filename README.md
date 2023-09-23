@@ -29,13 +29,14 @@ Data migrations are hard.
 We often have to write explicit migrations in multiple languages (our app
 language to manage migrations and the database language to do individual migrations).
 
-It would be nice to migrate data automatically and on demand (implicitly),
-instead of explicitly all at once in one big transaction.
+It would be nice to migrate data automatically and have the migrations type
+checked, that way we know if the program compiles the types can be migrated
+successfully (and that migrations have been included).
 
 ## How
 
 The approach here is to model our domain with types that are annotated with
-their version, and then to wrap the most recent version as the "current type":
+their version, and then to wrap/alias the most recent version as the "current type":
 
 ```rust
 pub struct PlayerV1 {
@@ -47,12 +48,12 @@ pub struct PlayerV2 {
     pub age: u32
 }
 
-pub struct Player(pub PlayerCharacterV2);
+pub type PlayerCharacter = PlayerCharacterV2;
 ```
 
 Each version of a type can be converted to either version adjacent to it, eg
 version 1 can be converted to version 2 and version 2 can be converted back to
-version 1:
+version 1 **without failure**:
 
 ```rust
 pub struct PlayerV1 {
@@ -67,6 +68,11 @@ impl From<PlayerV2> for PlayerV1 {
     }
 }
 
+pub struct PlayerV2 {
+    pub name: String,
+    pub age: u32
+}
+
 impl From<PlayerV1> for PlayerV2 {
     fn from(value: PlayerV1) -> PlayerV2 {
         PlayerV2 {
@@ -76,31 +82,58 @@ impl From<PlayerV1> for PlayerV2 {
     }
 }
 
-pub struct PlayerV2 {
-    pub name: String,
-    pub age: u32
+impl From<PlayerV3> for PlayerV2 {
+    fn from(value: PlayerV3) -> Self {
+        let PlayerV3 {
+            id,
+            name,
+            description: _,
+        } = value;
+        PlayerV2 { id, name, age: 0.0 }
+    }
 }
 
-pub struct Player(pub PlayerV2);
+pub struct PlayerV3 {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+}
+
+impl From<PlayerV2> for PlayerV3 {
+    fn from(value: PlayerV2) -> Self {
+        let PlayerV2 { id, name, age } = value;
+        PlayerV3 {
+            id,
+            name,
+            description: format!("{age} years old"),
+        }
+    }
+}
+
+pub type Player = PlayerV3;
 ```
 
-We then attempt to deserialize this type from the data's serialized origin (whatever that
-may be) by walking backwards through each version's deserialization code and
-then moving the type forwards through each conversion to the most current type:
+We can then forward migrate by constructing a type-path from the first version to the current one:
 
 ```rust
-impl From<PlayerV2> for Player {
-    fn from(value: PlayerV2) {
-        Player(value)
-    }
-}
-
-impl From<PlayerV1> for Player {
-    fn from(value: PlayerV1) {
-        Player(value.into())
-    }
-}
+let migrations = Migrations::<PlayerV1>::default()
+    .with_version::<PlayerV2>()
+    .with_version::<Player>();
+migrations.run(&connection).unwrap();
 ```
+
+Or we can go backward by constructing a type-path from the current version to the first one:
+
+```rust
+let migrations = Migrations::<Player>::default()
+    .with_version::<PlayerV2>()
+    .with_version::<PlayerV1>();
+migrations.run(&connection).unwrap();
+```
+
+There's no reason why the types we're migrating between have to be version of
+the same type, either. You could use this same method to migration data from one table to
+another that's only semi-related.
 
 In this way I hope to move migrations from SQL to Rust, which is easier for me
 to reason about because of the types and error handling that I know and love.
