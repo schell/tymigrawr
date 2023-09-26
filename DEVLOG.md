@@ -1,15 +1,19 @@
 # Devlog / Notes
 
+## Sep 26 2023
+
+### Abstracting the backend
+
 ## Sep 24 2023
 
-### Multiple Connections
+### Multiple connections
 
 I'm working on adding support for migrating w/ multiple connections. That way
 folks can migrate between tables/backends.
 
 ## Sep 23 2023
 
-### Multiple Backends
+### Multiple backends
 
 I'm dropping support for autoincrementing keys, at least for now. I like the
 idea of supporting multiple backends more than I like the idea of this library
@@ -24,7 +28,7 @@ could be one of the bigger "selling" points of the library.
 Anyway - I'm still proving the initial theory that we can make migrations easy
 and do them in Rust and it would kill some pain.
 
-### It Works!
+### It works!
 
 Forward and reverse migrations are working like a charm and are relatively
 snappy when writing to disk via sqlite3 even without any optimisation.
@@ -52,7 +56,7 @@ macro.
 
 Now down to the meat of problem. Lazy migrations are conceptually hard because
 a type may have any key (maybe even autoincrementing). It's hard to know ahead
-of time what the key field is without filtering a map of the fields. This makes
+of time what the key field is without filtering a map of `CrudFields`. This makes
 migrating all at once attractive, because you could just select everything
 and not worry about the keys. But then you're not gaining anything! In general
 autoincrementing primary keys mess up this pattern because there are multiple

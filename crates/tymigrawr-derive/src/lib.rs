@@ -142,7 +142,7 @@ pub fn derive_crud_fields(input: proc_macro::TokenStream) -> proc_macro::TokenSt
                 r
             }
 
-            fn as_crud_fields(&self) -> std::collections::HashMap<&str, sqlite::Value> {
+            fn as_crud_fields(&self) -> std::collections::HashMap<&str, tymigrawr::Value> {
                 std::collections::HashMap::from_iter([
                     #((stringify!(#field_idents), self.#field_idents.into_value())),*
                 ])
@@ -152,12 +152,12 @@ pub fn derive_crud_fields(input: proc_macro::TokenStream) -> proc_macro::TokenSt
                 #primary_key
             }
 
-            fn primary_key_val(&self) -> sqlite::Value {
+            fn primary_key_val(&self) -> tymigrawr::Value {
                 #primary_key_val
             }
 
             fn try_from_crud_fields(
-                fields: &std::collections::HashMap<&str, sqlite::Value>,
+                fields: &std::collections::HashMap<&str, tymigrawr::Value>,
             ) -> Result<Self, snafu::Whatever> {
                 #(#from_crud_fields)*
                 Ok(Self{

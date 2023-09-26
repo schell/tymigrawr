@@ -13,7 +13,7 @@ pub enum ValueType {
     Integer,
     Float,
     String,
-    Binary,
+    Bytes,
 }
 
 #[derive(Default)]
@@ -26,6 +26,7 @@ pub struct CrudField {
 }
 
 impl CrudField {
+    #[cfg(feature = "backend_sqlite")]
     pub fn sqlite_create_field(&self) -> String {
         let Self {
             name,
@@ -38,7 +39,7 @@ impl CrudField {
             ValueType::Integer => "INTEGER",
             ValueType::Float => "FLOAT",
             ValueType::String => "TEXT",
-            ValueType::Binary => "BLOB",
+            ValueType::Bytes => "BLOB",
         };
         let nullable = if *nullable { "" } else { "NOT NULL" };
         let prim_key = if *primary_key { "PRIMARY KEY" } else { "" };
@@ -47,12 +48,114 @@ impl CrudField {
     }
 }
 
+#[derive(Clone)]
+pub enum Value {
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    None,
+}
+
+#[cfg(feature = "backend_sqlite")]
+impl From<Value> for sqlite::Value {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Integer(i) => sqlite::Value::Integer(i),
+            Value::Float(i) => sqlite::Value::Float(i),
+            Value::String(i) => sqlite::Value::String(i),
+            Value::Bytes(i) => sqlite::Value::Binary(i),
+            Value::None => sqlite::Value::Null,
+        }
+    }
+}
+
+#[cfg(feature = "backend_sqlite")]
+impl From<sqlite::Value> for Value {
+    fn from(value: sqlite::Value) -> Self {
+        match value {
+            sqlite::Value::Integer(i) => Value::Integer(i),
+            sqlite::Value::Float(i) => Value::Float(i),
+            sqlite::Value::String(i) => Value::String(i),
+            sqlite::Value::Binary(i) => Value::Bytes(i),
+            sqlite::Value::Null => Value::None,
+        }
+    }
+}
+
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        Value::Integer(value)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(value: f64) -> Self {
+        Value::Float(value)
+    }
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Value::String(value)
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(value: Vec<u8>) -> Self {
+        Value::Bytes(value)
+    }
+}
+
+impl<T> From<Option<T>> for Value
+where
+    Value: From<T>,
+{
+    fn from(value: Option<T>) -> Self {
+        value.map(Value::from).unwrap_or(Value::None)
+    }
+}
+
+impl Value {
+    pub fn as_i64(&self) -> Option<i64> {
+        if let Value::Integer(i) = self {
+            Some(*i)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        if let Value::Float(i) = self {
+            Some(*i)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&String> {
+        if let Value::String(i) = self {
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        if let Value::Bytes(i) = self {
+            Some(i)
+        } else {
+            None
+        }
+    }
+}
+
 pub trait IsCrudField: Sized {
     type MaybeSelf;
 
     fn field() -> CrudField;
-    fn into_value(&self) -> sqlite::Value;
-    fn maybe_from_value(value: &sqlite::Value) -> Self::MaybeSelf;
+    fn into_value(&self) -> Value;
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf;
 }
 
 impl IsCrudField for i64 {
@@ -65,16 +168,12 @@ impl IsCrudField for i64 {
         }
     }
 
-    fn into_value(&self) -> sqlite::Value {
+    fn into_value(&self) -> Value {
         (*self).into()
     }
 
-    fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
-        if let sqlite::Value::Integer(i) = value {
-            Some(*i)
-        } else {
-            None
-        }
+    fn maybe_from_value(value: &Value) -> Option<Self> {
+        value.as_i64()
     }
 }
 
@@ -88,18 +187,15 @@ impl IsCrudField for i32 {
         }
     }
 
-    fn into_value(&self) -> sqlite::Value {
+    fn into_value(&self) -> Value {
         let i = i64::from(*self);
         i.into()
     }
 
-    fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
-        if let sqlite::Value::Integer(i) = value {
-            let i = i32::try_from(*i).ok()?;
-            Some(i)
-        } else {
-            None
-        }
+    fn maybe_from_value(value: &Value) -> Option<Self> {
+        let i = value.as_i64()?;
+        let i = i32::try_from(i).ok()?;
+        Some(i)
     }
 }
 
@@ -113,17 +209,14 @@ impl IsCrudField for u32 {
         }
     }
 
-    fn into_value(&self) -> sqlite::Value {
+    fn into_value(&self) -> Value {
         let i = i64::from(*self);
         i.into()
     }
 
-    fn maybe_from_value(value: &sqlite::Value) -> Self::MaybeSelf {
-        if let sqlite::Value::Integer(i) = value {
-            u32::try_from(*i).whatever_context("can't u32 from i64")
-        } else {
-            snafu::whatever!("not an integer")
-        }
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
+        let i = value.as_i64().whatever_context("not an integer")?;
+        u32::try_from(i).whatever_context("can't u32 from i64")
     }
 }
 
@@ -137,16 +230,12 @@ impl IsCrudField for String {
         }
     }
 
-    fn into_value(&self) -> sqlite::Value {
+    fn into_value(&self) -> Value {
         self.clone().into()
     }
 
-    fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
-        if let sqlite::Value::String(s) = value {
-            Some(s.clone())
-        } else {
-            None
-        }
+    fn maybe_from_value(value: &Value) -> Option<Self> {
+        value.as_string().cloned()
     }
 }
 
@@ -160,16 +249,12 @@ impl IsCrudField for f64 {
         }
     }
 
-    fn into_value(&self) -> sqlite::Value {
+    fn into_value(&self) -> Value {
         (*self).into()
     }
 
-    fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
-        if let sqlite::Value::Float(f) = value {
-            Some(*f)
-        } else {
-            None
-        }
+    fn maybe_from_value(value: &Value) -> Option<Self> {
+        value.as_f64()
     }
 }
 
@@ -183,16 +268,13 @@ impl IsCrudField for f32 {
         }
     }
 
-    fn into_value(&self) -> sqlite::Value {
+    fn into_value(&self) -> Value {
         (*self as f64).into()
     }
 
-    fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
-        if let sqlite::Value::Float(f) = value {
-            Some(*f as f32)
-        } else {
-            None
-        }
+    fn maybe_from_value(value: &Value) -> Option<Self> {
+        let f = value.as_f64()?;
+        Some(f as f32)
     }
 }
 
@@ -201,21 +283,18 @@ impl IsCrudField for Vec<u8> {
 
     fn field() -> CrudField {
         CrudField {
-            ty: ValueType::Binary,
+            ty: ValueType::Bytes,
             ..Default::default()
         }
     }
 
-    fn into_value(&self) -> sqlite::Value {
+    fn into_value(&self) -> Value {
         self.clone().into()
     }
 
-    fn maybe_from_value(value: &sqlite::Value) -> Option<Self> {
-        if let sqlite::Value::Binary(f) = value {
-            Some(f.clone())
-        } else {
-            None
-        }
+    fn maybe_from_value(value: &Value) -> Option<Self> {
+        let bytes = value.as_bytes()?;
+        Some(bytes.to_vec())
     }
 }
 
@@ -228,15 +307,11 @@ impl<T: IsCrudField> IsCrudField for Option<T> {
         cf
     }
 
-    fn into_value(&self) -> sqlite::Value {
-        if let Some(v) = self {
-            v.into_value()
-        } else {
-            sqlite::Value::Null
-        }
+    fn into_value(&self) -> Value {
+        self.as_ref().map(T::into_value).unwrap_or(Value::None)
     }
 
-    fn maybe_from_value(value: &sqlite::Value) -> Self::MaybeSelf {
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
         T::maybe_from_value(value)
     }
 }
@@ -246,7 +321,7 @@ fn read_all_values<'a>(
     table_name: &'a str,
     column_names: Vec<&'a str>,
 ) -> Result<
-    impl Iterator<Item = Result<HashMap<&'a str, sqlite::Value>, snafu::Whatever>> + 'a,
+    impl Iterator<Item = Result<HashMap<&'a str, Value>, snafu::Whatever>> + 'a,
     snafu::Whatever,
 > {
     let statement = format!("SELECT * FROM {table_name};");
@@ -254,12 +329,12 @@ fn read_all_values<'a>(
         .prepare(statement)
         .whatever_context("read all prepare")?;
     let cursor = query.into_iter().map(
-        move |row| -> Result<HashMap<&str, sqlite::Value>, snafu::Whatever> {
+        move |row| -> Result<HashMap<&str, Value>, snafu::Whatever> {
             let row = row.whatever_context("row")?;
             let mut cols = HashMap::default();
             for name in column_names.iter() {
                 let value = &row[*name];
-                cols.insert(*name, value.clone());
+                cols.insert(*name, value.clone().into());
             }
             Ok(cols)
         },
@@ -270,7 +345,7 @@ fn read_all_values<'a>(
 fn insert_fields(
     connection: &sqlite::Connection,
     table_name: &str,
-    fields: &HashMap<&str, sqlite::Value>,
+    fields: &HashMap<&str, Value>,
 ) -> Result<(), snafu::Whatever> {
     let columns = fields.iter().map(|f| *f.0).collect::<Vec<_>>().join(", ");
     let binds = fields
@@ -285,6 +360,7 @@ fn insert_fields(
     for (key, value) in fields.iter() {
         let key = format!(":{key}");
         let k = key.as_str();
+        let value = sqlite::Value::from(value.clone());
         query.bind((k, value)).whatever_context("insert bind")?;
     }
     snafu::ensure_whatever!(
@@ -297,10 +373,10 @@ fn insert_fields(
 pub trait HasCrudFields: Sized {
     fn table_name() -> &'static str;
     fn crud_fields() -> Vec<CrudField>;
-    fn as_crud_fields(&self) -> HashMap<&str, sqlite::Value>;
+    fn as_crud_fields(&self) -> HashMap<&str, Value>;
     fn primary_key_name() -> &'static str;
-    fn primary_key_val(&self) -> sqlite::Value;
-    fn try_from_crud_fields(fields: &HashMap<&str, sqlite::Value>)
+    fn primary_key_val(&self) -> Value;
+    fn try_from_crud_fields(fields: &HashMap<&str, Value>)
         -> Result<Self, snafu::Whatever>;
 }
 
@@ -308,13 +384,75 @@ pub struct Migration {
     table_name: Box<dyn Fn() -> &'static str>,
     crud_fields: Box<dyn Fn() -> Vec<CrudField>>,
     from_prev: Box<dyn Fn(Box<dyn core::any::Any>) -> Box<dyn core::any::Any>>,
-    as_crud_fields: Box<dyn Fn(&Box<dyn core::any::Any>) -> HashMap<&str, sqlite::Value>>,
+    as_crud_fields: Box<dyn Fn(&Box<dyn core::any::Any>) -> HashMap<&str, Value>>,
     try_from_crud_fields: Box<
-        dyn Fn(&HashMap<&str, sqlite::Value>) -> Result<Box<dyn core::any::Any>, snafu::Whatever>,
+        dyn Fn(&HashMap<&str, Value>) -> Result<Box<dyn core::any::Any>, snafu::Whatever>,
     >,
 }
 
-pub trait Crud: HasCrudFields + Clone + Sized + 'static {
+pub trait Crud<Backend>: HasCrudFields + Clone + Sized + 'static {
+    type Connection<'a>;
+
+    /// Create a table for `Self`.
+    fn create(connection: Self::Connection<'_>) -> Result<(), snafu::Whatever>;
+
+    fn insert(&self, connection: Self::Connection<'_>) -> Result<(), snafu::Whatever>;
+
+    fn read_all<'a>(
+        connection: Self::Connection<'a>,
+    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever>;
+
+    fn read_where<'a>(
+        connection: Self::Connection<'a>,
+        key_name: &'a str,
+        comparison: &'a str,
+        key_value: impl IsCrudField,
+    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever>;
+
+    fn read<'a, Key: IsCrudField>(
+        connection: Self::Connection<'a>,
+        key: Key,
+    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever>;
+
+    fn update(&self, connection: Self::Connection<'_>) -> Result<(), snafu::Whatever>;
+
+    fn delete(self, connection: Self::Connection<'_>) -> Result<(), snafu::Whatever>;
+
+    fn migration<T: 'static>() -> Migration
+    where
+        Self: From<T>,
+    {
+        Migration {
+            table_name: Box::new(Self::table_name),
+            crud_fields: Box::new(Self::crud_fields),
+            from_prev: Box::new(|any: Box<dyn core::any::Any>| {
+                // SAFETY: we know we can downcast because of the Self: From<T> constraint
+                let t: Box<T> = any.downcast().unwrap();
+                let s = Self::from(*t);
+                Box::new(s)
+            }),
+            as_crud_fields: Box::new(|any: &Box<dyn core::any::Any>| {
+                if let Some(t) = any.downcast_ref::<Self>() {
+                    t.as_crud_fields()
+                } else {
+                    Default::default()
+                }
+            }),
+            try_from_crud_fields: Box::new(|fields| {
+                let t = Self::try_from_crud_fields(fields)?;
+                Ok(Box::new(t))
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "backend_sqlite")]
+pub struct Sqlite;
+
+#[cfg(feature = "backend_sqlite")]
+impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
+    type Connection<'a> = &'a sqlite::Connection;
+
     /// Create a table for `Self`.
     fn create(connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
         let table_name = Self::table_name();
@@ -337,7 +475,7 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
     }
 
     fn read_all<'a>(
-        connection: &'a sqlite::Connection,
+        connection: Self::Connection<'a>,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
         let table_name = Self::table_name();
         let column_names = Self::crud_fields()
@@ -366,8 +504,10 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
         let mut query = connection
             .prepare(statement)
             .whatever_context("create prepare")?;
+        let value = key_value.into_value();
+        let value = sqlite::Value::from(value);
         query
-            .bind((":key_value", key_value.into_value()))
+            .bind((":key_value", value))
             .whatever_context("create bind")?;
         let cursor = query
             .into_iter()
@@ -376,7 +516,8 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
                 let mut cols = HashMap::default();
                 for name in column_names.iter() {
                     let value = &row[*name];
-                    cols.insert(*name, value.clone());
+                    let value = Value::from(value.clone());
+                    cols.insert(*name, value);
                 }
                 Self::try_from_crud_fields(&cols)
             });
@@ -384,7 +525,7 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
     }
 
     fn read<'a, Key: IsCrudField>(
-        connection: &'a sqlite::Connection,
+        connection: Self::Connection<'a>,
         key: Key,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
         Self::read_where(connection, Self::primary_key_name(), "=", key)
@@ -421,9 +562,11 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
             }
             let key = format!(":{key}");
             let k = key.as_str();
-            query.bind((k, value)).whatever_context("update bind")?;
+            let v = sqlite::Value::from(value);
+            query.bind((k, v)).whatever_context("update bind")?;
         }
         let key_value = key_value.whatever_context("no key value")?;
+        let key_value = sqlite::Value::from(key_value);
         query
             .bind((":key_value", key_value))
             .whatever_context("update bind key_value")?;
@@ -454,6 +597,7 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
             .into_iter()
             .find_map(|(k, v)| if k == key_name { Some(v) } else { None })
             .whatever_context("missing primary key value")?;
+        let key_value = sqlite::Value::from(key_value);
         let statement =
             format!("DELETE FROM {table_name} WHERE {key_name} = :key_value RETURNING *");
         let mut query = connection
@@ -467,35 +611,34 @@ pub trait Crud: HasCrudFields + Clone + Sized + 'static {
         Ok(())
     }
 
-    fn migration<T: 'static>() -> Migration
+    fn migration<S: 'static>() -> Migration
     where
-        Self: From<T>,
+        Self: From<S>,
     {
         Migration {
             table_name: Box::new(Self::table_name),
             crud_fields: Box::new(Self::crud_fields),
             from_prev: Box::new(|any: Box<dyn core::any::Any>| {
                 // SAFETY: we know we can downcast because of the Self: From<T> constraint
-                let t: Box<T> = any.downcast().unwrap();
+                let t: Box<S> = any.downcast().unwrap();
                 let s = Self::from(*t);
                 Box::new(s)
             }),
             as_crud_fields: Box::new(|any: &Box<dyn core::any::Any>| {
-                if let Some(t) = any.downcast_ref::<Self>() {
-                    t.as_crud_fields()
+                if let Some(s) = any.downcast_ref::<Self>() {
+                    s.as_crud_fields()
                 } else {
                     Default::default()
                 }
             }),
             try_from_crud_fields: Box::new(|fields| {
-                let t = Self::try_from_crud_fields(fields)?;
-                Ok(Box::new(t))
+                let s = Self::try_from_crud_fields(fields)?;
+                Ok(Box::new(s))
             }),
         }
     }
-}
 
-impl<T: HasCrudFields + Clone + Sized + 'static> Crud for T {}
+}
 
 pub struct Migrations<T> {
     _current: PhantomData<T>,
@@ -576,7 +719,11 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
                 // Save it in the most current table, if need be.
                 if current_table_name != prev_table_name {
                     let fields = (last_migration.as_crud_fields)(&current);
-                    insert_fields((mk_connection)(current_table_name), current_table_name, &fields)?;
+                    insert_fields(
+                        (mk_connection)(current_table_name),
+                        current_table_name,
+                        &fields,
+                    )?;
                 }
             }
             log::info!("    migrated {entries} entries from {prev_table_name}",);
@@ -584,7 +731,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
             if current_table_name != prev_table_name {
                 log::info!("    clearing out previous table {prev_table_name}");
                 let statement = format!("DELETE FROM {prev_table_name};");
-                    let mut query = (mk_connection)(prev_table_name)
+                let mut query = (mk_connection)(prev_table_name)
                     .prepare(&statement)
                     .whatever_context("prepare clear table")?;
                 while let Ok(_) = query.next() {}
