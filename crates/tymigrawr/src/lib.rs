@@ -7,6 +7,17 @@ use snafu::prelude::*;
 
 pub use tymigrawr_derive::HasCrudFields;
 
+#[cfg(feature = "backend_sqlite")]
+mod backend_sqlite;
+#[cfg(feature = "backend_sqlite")]
+pub use backend_sqlite::*;
+
+#[cfg(feature = "backend_dynamodb")]
+mod backend_dynamodb;
+#[cfg(feature = "backend_dynamdb")]
+pub use backend_dynamodb::*;
+
+
 #[derive(Default)]
 pub enum ValueType {
     #[default]
@@ -25,62 +36,13 @@ pub struct CrudField {
     pub auto_increment: bool,
 }
 
-impl CrudField {
-    #[cfg(feature = "backend_sqlite")]
-    pub fn sqlite_create_field(&self) -> String {
-        let Self {
-            name,
-            ty,
-            nullable,
-            primary_key,
-            auto_increment,
-        } = self;
-        let ty = match ty {
-            ValueType::Integer => "INTEGER",
-            ValueType::Float => "FLOAT",
-            ValueType::String => "TEXT",
-            ValueType::Bytes => "BLOB",
-        };
-        let nullable = if *nullable { "" } else { "NOT NULL" };
-        let prim_key = if *primary_key { "PRIMARY KEY" } else { "" };
-        let inc = if *auto_increment { "AUTOINCREMENT" } else { "" };
-        format!("{name} {ty} {prim_key} {inc} {nullable}")
-    }
-}
-
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Integer(i64),
     Float(f64),
     String(String),
     Bytes(Vec<u8>),
     None,
-}
-
-#[cfg(feature = "backend_sqlite")]
-impl From<Value> for sqlite::Value {
-    fn from(value: Value) -> Self {
-        match value {
-            Value::Integer(i) => sqlite::Value::Integer(i),
-            Value::Float(i) => sqlite::Value::Float(i),
-            Value::String(i) => sqlite::Value::String(i),
-            Value::Bytes(i) => sqlite::Value::Binary(i),
-            Value::None => sqlite::Value::Null,
-        }
-    }
-}
-
-#[cfg(feature = "backend_sqlite")]
-impl From<sqlite::Value> for Value {
-    fn from(value: sqlite::Value) -> Self {
-        match value {
-            sqlite::Value::Integer(i) => Value::Integer(i),
-            sqlite::Value::Float(i) => Value::Float(i),
-            sqlite::Value::String(i) => Value::String(i),
-            sqlite::Value::Binary(i) => Value::Bytes(i),
-            sqlite::Value::Null => Value::None,
-        }
-    }
 }
 
 impl From<i64> for Value {
@@ -316,68 +278,13 @@ impl<T: IsCrudField> IsCrudField for Option<T> {
     }
 }
 
-fn read_all_values<'a>(
-    connection: &'a sqlite::Connection,
-    table_name: &'a str,
-    column_names: Vec<&'a str>,
-) -> Result<
-    impl Iterator<Item = Result<HashMap<&'a str, Value>, snafu::Whatever>> + 'a,
-    snafu::Whatever,
-> {
-    let statement = format!("SELECT * FROM {table_name};");
-    let query = connection
-        .prepare(statement)
-        .whatever_context("read all prepare")?;
-    let cursor = query.into_iter().map(
-        move |row| -> Result<HashMap<&str, Value>, snafu::Whatever> {
-            let row = row.whatever_context("row")?;
-            let mut cols = HashMap::default();
-            for name in column_names.iter() {
-                let value = &row[*name];
-                cols.insert(*name, value.clone().into());
-            }
-            Ok(cols)
-        },
-    );
-    Ok(cursor)
-}
-
-fn insert_fields(
-    connection: &sqlite::Connection,
-    table_name: &str,
-    fields: &HashMap<&str, Value>,
-) -> Result<(), snafu::Whatever> {
-    let columns = fields.iter().map(|f| *f.0).collect::<Vec<_>>().join(", ");
-    let binds = fields
-        .iter()
-        .map(|f| format!(":{}", *f.0))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let statement = format!("INSERT INTO {table_name} ({columns}) VALUES ({binds});");
-    let mut query = connection
-        .prepare(&statement)
-        .whatever_context(format!("insert prepare: {statement}"))?;
-    for (key, value) in fields.iter() {
-        let key = format!(":{key}");
-        let k = key.as_str();
-        let value = sqlite::Value::from(value.clone());
-        query.bind((k, value)).whatever_context("insert bind")?;
-    }
-    snafu::ensure_whatever!(
-        matches!(query.next(), Ok(sqlite::State::Done)),
-        "insert query not ok"
-    );
-    Ok(())
-}
-
 pub trait HasCrudFields: Sized {
     fn table_name() -> &'static str;
     fn crud_fields() -> Vec<CrudField>;
     fn as_crud_fields(&self) -> HashMap<&str, Value>;
     fn primary_key_name() -> &'static str;
     fn primary_key_val(&self) -> Value;
-    fn try_from_crud_fields(fields: &HashMap<&str, Value>)
-        -> Result<Self, snafu::Whatever>;
+    fn try_from_crud_fields(fields: &HashMap<&str, Value>) -> Result<Self, snafu::Whatever>;
 }
 
 pub struct Migration {
@@ -385,9 +292,8 @@ pub struct Migration {
     crud_fields: Box<dyn Fn() -> Vec<CrudField>>,
     from_prev: Box<dyn Fn(Box<dyn core::any::Any>) -> Box<dyn core::any::Any>>,
     as_crud_fields: Box<dyn Fn(&Box<dyn core::any::Any>) -> HashMap<&str, Value>>,
-    try_from_crud_fields: Box<
-        dyn Fn(&HashMap<&str, Value>) -> Result<Box<dyn core::any::Any>, snafu::Whatever>,
-    >,
+    try_from_crud_fields:
+        Box<dyn Fn(&HashMap<&str, Value>) -> Result<Box<dyn core::any::Any>, snafu::Whatever>>,
 }
 
 pub trait Crud<Backend>: HasCrudFields + Clone + Sized + 'static {
@@ -446,206 +352,35 @@ pub trait Crud<Backend>: HasCrudFields + Clone + Sized + 'static {
     }
 }
 
-#[cfg(feature = "backend_sqlite")]
-pub struct Sqlite;
+pub trait MigrateEntireTable {
+    type Connection<'a>: Copy;
 
-#[cfg(feature = "backend_sqlite")]
-impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
-    type Connection<'a> = &'a sqlite::Connection;
-
-    /// Create a table for `Self`.
-    fn create(connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
-        let table_name = Self::table_name();
-        let fields: String = Self::crud_fields()
-            .iter()
-            .map(CrudField::sqlite_create_field)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let statement = format!("CREATE TABLE IF NOT EXISTS {table_name} ({fields});");
-        connection
-            .execute(statement)
-            .whatever_context("could not create")
-    }
-
-    fn insert(&self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
-        let table_name = Self::table_name();
-        let fields = self.as_crud_fields();
-        insert_fields(connection, table_name, &fields)?;
-        Ok(())
-    }
-
-    fn read_all<'a>(
+    fn read_all_values<'a>(
         connection: Self::Connection<'a>,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
-        let table_name = Self::table_name();
-        let column_names = Self::crud_fields()
-            .iter()
-            .map(|field| field.name)
-            .collect::<Vec<_>>();
-        let cursor = read_all_values(connection, table_name, column_names)?;
-        Ok(Box::new(
-            cursor.map(|cols| Self::try_from_crud_fields(&cols?)),
-        ))
-    }
+        table_name: &'a str,
+        column_names: Vec<&'a str>,
+    ) -> Result<Vec<Result<HashMap<&'a str, Value>, snafu::Whatever>>, snafu::Whatever>;
 
-    fn read_where<'a>(
-        connection: &'a sqlite::Connection,
-        key_name: &'a str,
-        comparison: &'a str,
-        key_value: impl IsCrudField,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
-        let table_name = Self::table_name();
-        let column_names = Self::crud_fields()
-            .iter()
-            .map(|field| field.name)
-            .collect::<Vec<_>>();
-        let statement =
-            format!("SELECT * FROM {table_name} WHERE {key_name} {comparison} :key_value");
-        let mut query = connection
-            .prepare(statement)
-            .whatever_context("create prepare")?;
-        let value = key_value.into_value();
-        let value = sqlite::Value::from(value);
-        query
-            .bind((":key_value", value))
-            .whatever_context("create bind")?;
-        let cursor = query
-            .into_iter()
-            .map(move |row| -> Result<Self, snafu::Whatever> {
-                let row = row.whatever_context("row")?;
-                let mut cols = HashMap::default();
-                for name in column_names.iter() {
-                    let value = &row[*name];
-                    let value = Value::from(value.clone());
-                    cols.insert(*name, value);
-                }
-                Self::try_from_crud_fields(&cols)
-            });
-        Ok(Box::new(cursor))
-    }
+    fn insert_fields(
+        connection: Self::Connection<'_>,
+        table_name: &str,
+        fields: &HashMap<&str, Value>,
+    ) -> Result<(), snafu::Whatever>;
 
-    fn read<'a, Key: IsCrudField>(
-        connection: Self::Connection<'a>,
-        key: Key,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
-        Self::read_where(connection, Self::primary_key_name(), "=", key)
-    }
-
-    fn update(&self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
-        let fields = self.as_crud_fields();
-        let mut primary_key: Option<&str> = None;
-        let values = Self::crud_fields()
-            .iter()
-            .filter_map(|field| {
-                if field.primary_key {
-                    primary_key = Some(field.name);
-                    None
-                } else {
-                    Some(format!("{} = :{}", field.name, field.name))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let primary_key = primary_key.whatever_context("missing primary key")?;
-
-        let table_name = Self::table_name();
-        let statement =
-            format!("UPDATE {table_name} SET {values} WHERE {primary_key} = :key_value",);
-        let mut query = connection
-            .prepare(statement)
-            .whatever_context("update prepare")?;
-        let mut key_value = None;
-        for (key, value) in fields.into_iter() {
-            if key == primary_key {
-                key_value = Some(value);
-                continue;
-            }
-            let key = format!(":{key}");
-            let k = key.as_str();
-            let v = sqlite::Value::from(value);
-            query.bind((k, v)).whatever_context("update bind")?;
-        }
-        let key_value = key_value.whatever_context("no key value")?;
-        let key_value = sqlite::Value::from(key_value);
-        query
-            .bind((":key_value", key_value))
-            .whatever_context("update bind key_value")?;
-
-        if let Ok(sqlite::State::Done) = query.next() {
-            Ok(())
-        } else {
-            snafu::whatever!("update next")
-        }?;
-
-        Ok(())
-    }
-
-    fn delete(self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
-        let table_name = Self::table_name();
-        let key_name = Self::crud_fields()
-            .into_iter()
-            .find_map(|field| {
-                if field.primary_key {
-                    Some(field.name)
-                } else {
-                    None
-                }
-            })
-            .whatever_context("missing primary key")?;
-        let key_value = self
-            .as_crud_fields()
-            .into_iter()
-            .find_map(|(k, v)| if k == key_name { Some(v) } else { None })
-            .whatever_context("missing primary key value")?;
-        let key_value = sqlite::Value::from(key_value);
-        let statement =
-            format!("DELETE FROM {table_name} WHERE {key_name} = :key_value RETURNING *");
-        let mut query = connection
-            .prepare(statement)
-            .whatever_context("delete prepare")?;
-        query
-            .bind((":key_value", key_value))
-            .whatever_context("delete bind key_value")?;
-        while let Ok(sqlite::State::Row) = query.next() {}
-
-        Ok(())
-    }
-
-    fn migration<S: 'static>() -> Migration
-    where
-        Self: From<S>,
-    {
-        Migration {
-            table_name: Box::new(Self::table_name),
-            crud_fields: Box::new(Self::crud_fields),
-            from_prev: Box::new(|any: Box<dyn core::any::Any>| {
-                // SAFETY: we know we can downcast because of the Self: From<T> constraint
-                let t: Box<S> = any.downcast().unwrap();
-                let s = Self::from(*t);
-                Box::new(s)
-            }),
-            as_crud_fields: Box::new(|any: &Box<dyn core::any::Any>| {
-                if let Some(s) = any.downcast_ref::<Self>() {
-                    s.as_crud_fields()
-                } else {
-                    Default::default()
-                }
-            }),
-            try_from_crud_fields: Box::new(|fields| {
-                let s = Self::try_from_crud_fields(fields)?;
-                Ok(Box::new(s))
-            }),
-        }
-    }
-
+    fn delete_all(
+        connection: Self::Connection<'_>,
+        table_name: &str,
+    ) -> Result<(), snafu::Whatever>;
 }
 
-pub struct Migrations<T> {
-    _current: PhantomData<T>,
+pub struct Migrations<T, Backend> {
+    _current: PhantomData<(T, Backend)>,
     all: VecDeque<Migration>,
 }
 
-impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
+impl<T: HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
+    Migrations<T, Backend>
+{
     pub fn default() -> Self {
         Self {
             _current: PhantomData,
@@ -655,8 +390,10 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
     }
 }
 
-impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
-    pub fn with_version<Next>(self) -> Migrations<Next>
+impl<T: HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
+    Migrations<T, Backend>
+{
+    pub fn with_version<Next>(self) -> Migrations<Next, Backend>
     where
         Next: From<T> + HasCrudFields + Clone + Sized + 'static,
     {
@@ -671,13 +408,13 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
         }
     }
 
-    pub fn run<'a>(self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
+    pub fn run<'a>(self, connection: Backend::Connection<'a>) -> Result<(), snafu::Whatever> {
         self.run_with(|_| connection)
     }
 
     pub fn run_with<'a>(
         self,
-        mk_connection: impl Fn(&str) -> &'a sqlite::Connection,
+        mk_connection: impl Fn(&str) -> Backend::Connection<'a>,
     ) -> Result<(), snafu::Whatever> {
         let Self { _current, mut all } = self;
         log::info!(
@@ -694,7 +431,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
             let fields = (migration.crud_fields)();
             let column_names = fields.iter().map(|f| f.name).collect::<Vec<_>>();
             // Get a cursor of each value in the prev table
-            let cursor = read_all_values(
+            let cursor = Backend::read_all_values(
                 (mk_connection)(prev_table_name),
                 prev_table_name,
                 column_names,
@@ -719,7 +456,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
                 // Save it in the most current table, if need be.
                 if current_table_name != prev_table_name {
                     let fields = (last_migration.as_crud_fields)(&current);
-                    insert_fields(
+                    Backend::insert_fields(
                         (mk_connection)(current_table_name),
                         current_table_name,
                         &fields,
@@ -730,11 +467,8 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
             // Remove the old entries if need be
             if current_table_name != prev_table_name {
                 log::info!("    clearing out previous table {prev_table_name}");
-                let statement = format!("DELETE FROM {prev_table_name};");
-                let mut query = (mk_connection)(prev_table_name)
-                    .prepare(&statement)
-                    .whatever_context("prepare clear table")?;
-                while let Ok(_) = query.next() {}
+                let conn = (mk_connection)(prev_table_name);
+                Backend::delete_all(conn, prev_table_name)?;
             }
         }
         Ok(())
@@ -743,9 +477,10 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Migrations<T> {
 
 #[cfg(test)]
 mod test {
+    use aws_sdk_dynamodb::types::AttributeValue;
     use snafu::prelude::*;
 
-    use crate::{self as tymigrawr, Crud, HasCrudFields, IsCrudField, Migrations};
+    use crate::{self as tymigrawr, Crud, HasCrudFields, IsCrudField, Migrations, Value, Sqlite};
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV1 {
@@ -928,7 +663,7 @@ mod test {
             .collect::<Vec<_>>();
 
         log::debug!("running forward migrations");
-        let migrations = Migrations::<PlayerV1>::default()
+        let migrations = Migrations::<PlayerV1, Sqlite>::default()
             .with_version::<PlayerV2>()
             .with_version::<Player>();
         migrations
@@ -951,7 +686,7 @@ mod test {
         assert_eq!(players_v3, players_v3_from_db);
 
         log::debug!("running reverse migrations");
-        let migrations = Migrations::<Player>::default()
+        let migrations = Migrations::<Player, Sqlite>::default()
             .with_version::<PlayerV2>()
             .with_version::<PlayerV1>();
         migrations
@@ -965,5 +700,20 @@ mod test {
             .map(|r| r.unwrap())
             .collect::<Vec<_>>();
         assert_eq!(players_v1, players_v1_from_db);
+    }
+
+    #[test]
+    fn dynamodb_float_int_roundtrip() {
+        let int_value = Value::Integer(66);
+        let int_dydb = AttributeValue::from(int_value.clone());
+        assert_eq!(int_value, Value::from(int_dydb));
+
+        let float_value = Value::Float(600.66);
+        let float_dydb = AttributeValue::from(float_value.clone());
+        assert_eq!(float_value, Value::from(float_dydb));
+
+        //let float_value = Value::Float(600.0);
+        //let float_dydb = AttributeValue::from(float_value.clone());
+        //assert_eq!(float_value, Value::from(float_dydb));
     }
 }
