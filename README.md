@@ -126,9 +126,12 @@ let migrations = Migrations::<Player>::default()
 migrations.run(&connection).unwrap();
 ```
 
-There's no reason why the types we're migrating between have to be version of
-the same type, either. You could use this same method to migration data from one table to
-another that's only semi-related.
+There's no reason why the types we're migrating between have to be versions of
+the same type, either. You could use this method to migrate data from one table to
+another table.
+
+This pattern is especially useful with key-value stores where the table elements
+can be migrated lazily, on-demand.
 
 In this way I hope to move migrations from SQL (or some other store) to Rust, which is easier for me
 to reason about because of the types and error handling that I know and love.
