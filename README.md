@@ -6,14 +6,9 @@
   </h1>
 </div>
 
-> "Clever as Dr. Ian Malcolm himself, remember that neglecting the intricate
-> dance of data evolution in your modeling can turn your once-orderly systems
-> into chaotic, dino-sized debacles, leaving you wishing for a T-Rex-sized
-> umbrella!"
+> "Life finds a way. Your data shouldn't."
 >
-> -- Chat GPT after much cajolling, seemingly implying that a shit storm of
->    pain awaits you and your teamates in the event you misrepresent the
->    evolution of your program's data over time.
+> — Dr. Ian Malcolm, probably
 
 We often think of our current data types as the truth of our program,
 disregarding previous attempts at modeling our domain.
@@ -135,7 +130,7 @@ There's no reason why the types we're migrating between have to be version of
 the same type, either. You could use this same method to migration data from one table to
 another that's only semi-related.
 
-In this way I hope to move migrations from SQL to Rust, which is easier for me
+In this way I hope to move migrations from SQL (or some other store) to Rust, which is easier for me
 to reason about because of the types and error handling that I know and love.
 
 # What

@@ -12,12 +12,6 @@ mod backend_sqlite;
 #[cfg(feature = "backend_sqlite")]
 pub use backend_sqlite::*;
 
-#[cfg(feature = "backend_dynamodb")]
-mod backend_dynamodb;
-#[cfg(feature = "backend_dynamdb")]
-pub use backend_dynamodb::*;
-
-
 #[derive(Default)]
 pub enum ValueType {
     #[default]
@@ -477,10 +471,9 @@ impl<T: HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
 
 #[cfg(test)]
 mod test {
-    use aws_sdk_dynamodb::types::AttributeValue;
     use snafu::prelude::*;
 
-    use crate::{self as tymigrawr, Crud, HasCrudFields, IsCrudField, Migrations, Value, Sqlite};
+    use crate::{self as tymigrawr, Crud, HasCrudFields, IsCrudField, Migrations, Sqlite};
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV1 {
@@ -700,20 +693,5 @@ mod test {
             .map(|r| r.unwrap())
             .collect::<Vec<_>>();
         assert_eq!(players_v1, players_v1_from_db);
-    }
-
-    #[test]
-    fn dynamodb_float_int_roundtrip() {
-        let int_value = Value::Integer(66);
-        let int_dydb = AttributeValue::from(int_value.clone());
-        assert_eq!(int_value, Value::from(int_dydb));
-
-        let float_value = Value::Float(600.66);
-        let float_dydb = AttributeValue::from(float_value.clone());
-        assert_eq!(float_value, Value::from(float_dydb));
-
-        //let float_value = Value::Float(600.0);
-        //let float_dydb = AttributeValue::from(float_value.clone());
-        //assert_eq!(float_value, Value::from(float_dydb));
     }
 }
