@@ -14,7 +14,7 @@ We often think of our current data types as the truth of our program,
 disregarding previous attempts at modeling our domain.
 But our programs evolve over time, they are organisms, and often there are more
 than one instance of them in the wild.
-Unlike organisms though, instances in the wild may be evolved or "ascended" to
+Unlike organisms though, data in the wild can be updated in real time to
 the most current, and maybe our program's data types should encourage this ascension from
 the get go, and maybe in doing so we save ourselves some trouble.
 
