@@ -12,6 +12,11 @@ mod backend_sqlite;
 #[cfg(feature = "backend_sqlite")]
 pub use backend_sqlite::*;
 
+#[cfg(feature = "backend_toml")]
+mod backend_toml;
+#[cfg(feature = "backend_toml")]
+pub use backend_toml::*;
+
 #[derive(Default)]
 pub enum ValueType {
     #[default]
@@ -290,33 +295,39 @@ pub struct Migration {
         Box<dyn Fn(&HashMap<&str, Value>) -> Result<Box<dyn core::any::Any>, snafu::Whatever>>,
 }
 
-pub trait Crud<Backend>: HasCrudFields + Clone + Sized + 'static {
-    type Connection<'a>;
+pub trait CrudBackend {
+    type Connection<'a>: Copy;
+}
 
+pub trait Crud<Backend>
+where
+    Self: HasCrudFields + Clone + Sized + 'static,
+    Backend: CrudBackend,
+{
     /// Create a table for `Self`.
-    fn create(connection: Self::Connection<'_>) -> Result<(), snafu::Whatever>;
+    fn create(connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
 
-    fn insert(&self, connection: Self::Connection<'_>) -> Result<(), snafu::Whatever>;
+    fn insert(&self, connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
 
     fn read_all<'a>(
-        connection: Self::Connection<'a>,
+        connection: Backend::Connection<'a>,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever>;
 
     fn read_where<'a>(
-        connection: Self::Connection<'a>,
+        connection: Backend::Connection<'a>,
         key_name: &'a str,
         comparison: &'a str,
         key_value: impl IsCrudField,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever>;
 
     fn read<'a, Key: IsCrudField>(
-        connection: Self::Connection<'a>,
+        connection: Backend::Connection<'a>,
         key: Key,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever>;
 
-    fn update(&self, connection: Self::Connection<'_>) -> Result<(), snafu::Whatever>;
+    fn update(&self, connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
 
-    fn delete(self, connection: Self::Connection<'_>) -> Result<(), snafu::Whatever>;
+    fn delete(self, connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
 
     fn migration<T: 'static>() -> Migration
     where
@@ -346,23 +357,21 @@ pub trait Crud<Backend>: HasCrudFields + Clone + Sized + 'static {
     }
 }
 
-pub trait MigrateEntireTable {
-    type Connection<'a>: Copy;
-
+pub trait MigrateEntireTable: CrudBackend {
     fn read_all_values<'a>(
-        connection: Self::Connection<'a>,
+        connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
-        column_names: Vec<&'a str>,
+        fields: Vec<CrudField>,
     ) -> Result<Vec<Result<HashMap<&'a str, Value>, snafu::Whatever>>, snafu::Whatever>;
 
     fn insert_fields(
-        connection: Self::Connection<'_>,
+        connection: <Self as CrudBackend>::Connection<'_>,
         table_name: &str,
         fields: &HashMap<&str, Value>,
     ) -> Result<(), snafu::Whatever>;
 
     fn delete_all(
-        connection: Self::Connection<'_>,
+        connection: <Self as CrudBackend>::Connection<'_>,
         table_name: &str,
     ) -> Result<(), snafu::Whatever>;
 }
@@ -372,7 +381,7 @@ pub struct Migrations<T, Backend> {
     all: VecDeque<Migration>,
 }
 
-impl<T: HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
+impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
     Migrations<T, Backend>
 {
     pub fn default() -> Self {
@@ -382,33 +391,32 @@ impl<T: HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
         }
         .with_version::<T>()
     }
-}
 
-impl<T: HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
-    Migrations<T, Backend>
-{
     pub fn with_version<Next>(self) -> Migrations<Next, Backend>
     where
-        Next: From<T> + HasCrudFields + Clone + Sized + 'static,
+        Next: From<T> + Crud<Backend> + HasCrudFields + Clone + Sized + 'static,
     {
         let Self {
             _current: _,
             mut all,
         } = self;
-        all.push_back(Next::migration());
+        all.push_back(<Next as Crud<Backend>>::migration::<T>());
         Migrations {
             _current: PhantomData,
             all,
         }
     }
 
-    pub fn run<'a>(self, connection: Backend::Connection<'a>) -> Result<(), snafu::Whatever> {
+    pub fn run<'a>(
+        self,
+        connection: <Backend as CrudBackend>::Connection<'a>,
+    ) -> Result<(), snafu::Whatever> {
         self.run_with(|_| connection)
     }
 
     pub fn run_with<'a>(
         self,
-        mk_connection: impl Fn(&str) -> Backend::Connection<'a>,
+        mk_connection: impl Fn(&str) -> <Backend as CrudBackend>::Connection<'a>,
     ) -> Result<(), snafu::Whatever> {
         let Self { _current, mut all } = self;
         log::info!(
@@ -423,12 +431,11 @@ impl<T: HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
             let prev_table_name = (migration.table_name)();
             log::info!("  checking {prev_table_name}");
             let fields = (migration.crud_fields)();
-            let column_names = fields.iter().map(|f| f.name).collect::<Vec<_>>();
             // Get a cursor of each value in the prev table
             let cursor = Backend::read_all_values(
                 (mk_connection)(prev_table_name),
                 prev_table_name,
-                column_names,
+                fields,
             )?;
             let mut current_table_name = prev_table_name;
             let mut entries = 0;
@@ -473,7 +480,10 @@ impl<T: HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
 mod test {
     use snafu::prelude::*;
 
-    use crate::{self as tymigrawr, Crud, HasCrudFields, IsCrudField, Migrations, Sqlite};
+    use crate::{
+        self as tymigrawr, Crud, CrudBackend, HasCrudFields, IsCrudField, MigrateEntireTable,
+        Migrations,
+    };
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV1 {
@@ -509,85 +519,6 @@ mod test {
         pub age: f32,
     }
 
-    #[test]
-    fn p1_crud() {
-        let connection = sqlite::open(":memory:").unwrap();
-        PlayerV1::create(&connection).unwrap();
-        let first_player = PlayerV1 {
-            id: 0,
-            name: "tymigrawr".to_string(),
-        };
-        first_player.insert(&connection).unwrap();
-        let player = PlayerV1::read(&connection, 0)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert_eq!(first_player, player);
-        let mut second_player = PlayerV1 {
-            id: 1,
-            name: "developer".to_string(),
-        };
-        second_player.insert(&connection).unwrap();
-        let player = PlayerV1::read(&connection, 1)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert_eq!(second_player, player);
-
-        let mut p1 = PlayerV1::read(&connection, first_player.id).unwrap();
-        assert_eq!(first_player, p1.next().unwrap().unwrap());
-        let mut p2 = PlayerV1::read(&connection, second_player.id).unwrap();
-        assert_eq!(second_player, p2.next().unwrap().unwrap());
-
-        second_player.name = "software engineer".to_string();
-        second_player.update(&connection).unwrap();
-        let p2 = PlayerV1::read(&connection, second_player.id)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert_eq!(second_player, p2);
-
-        second_player.delete(&connection).unwrap();
-        let players = PlayerV1::read(&connection, p2.id)
-            .unwrap()
-            .map(|p| p.unwrap())
-            .collect::<Vec<_>>();
-        assert!(players.is_empty());
-    }
-
-    #[test]
-    fn p2_crud() {
-        let connection = sqlite::open(":memory:").unwrap();
-        PlayerV2::create(&connection).unwrap();
-        let mut first_player = PlayerV2 {
-            id: 0,
-            name: "tymigrawr".to_string(),
-            age: 0.1,
-        };
-        first_player.insert(&connection).unwrap();
-        let mut p1 = PlayerV2::read(&connection, first_player.id).unwrap();
-        assert_eq!(first_player, p1.next().unwrap().unwrap());
-
-        first_player.name = "software engineer".to_string();
-        first_player.update(&connection).unwrap();
-        let p2 = PlayerV2::read(&connection, first_player.id)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert_eq!(first_player, p2);
-
-        first_player.delete(&connection).unwrap();
-        let players = PlayerV2::read(&connection, p2.id)
-            .unwrap()
-            .map(|p| p.unwrap())
-            .collect::<Vec<_>>();
-        assert!(players.is_empty());
-    }
-
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV3 {
         #[primary_key]
@@ -620,23 +551,103 @@ mod test {
 
     pub type Player = PlayerV3;
 
-    #[test]
-    fn migrate() {
+    fn test_p1_crud<B: CrudBackend>(conn: B::Connection<'_>)
+    where
+        PlayerV1: Crud<B>,
+    {
+        <PlayerV1 as Crud<B>>::create(conn).unwrap();
+        let first_player = PlayerV1 {
+            id: 0,
+            name: "tymigrawr".to_string(),
+        };
+        <PlayerV1 as Crud<B>>::insert(&first_player, conn).unwrap();
+        let player = <PlayerV1 as Crud<B>>::read(conn, 0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_player, player);
+        let mut second_player = PlayerV1 {
+            id: 1,
+            name: "developer".to_string(),
+        };
+        <PlayerV1 as Crud<B>>::insert(&second_player, conn).unwrap();
+        let player = <PlayerV1 as Crud<B>>::read(conn, 1)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_player, player);
+
+        let mut p1 = <PlayerV1 as Crud<B>>::read(conn, first_player.id).unwrap();
+        assert_eq!(first_player, p1.next().unwrap().unwrap());
+        let mut p2 = <PlayerV1 as Crud<B>>::read(conn, second_player.id).unwrap();
+        assert_eq!(second_player, p2.next().unwrap().unwrap());
+
+        second_player.name = "software engineer".to_string();
+        <PlayerV1 as Crud<B>>::update(&second_player, conn).unwrap();
+        let p2 = <PlayerV1 as Crud<B>>::read(conn, second_player.id)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_player, p2);
+
+        <PlayerV1 as Crud<B>>::delete(second_player, conn).unwrap();
+        let players = <PlayerV1 as Crud<B>>::read(conn, p2.id)
+            .unwrap()
+            .map(|p| p.unwrap())
+            .collect::<Vec<_>>();
+        assert!(players.is_empty());
+    }
+
+    fn test_p2_crud<B: CrudBackend>(conn: B::Connection<'_>)
+    where
+        PlayerV2: Crud<B>,
+    {
+        <PlayerV2 as Crud<B>>::create(conn).unwrap();
+        let mut first_player = PlayerV2 {
+            id: 0,
+            name: "tymigrawr".to_string(),
+            age: 0.1,
+        };
+        <PlayerV2 as Crud<B>>::insert(&first_player, conn).unwrap();
+        let mut p1 = <PlayerV2 as Crud<B>>::read(conn, first_player.id).unwrap();
+        assert_eq!(first_player, p1.next().unwrap().unwrap());
+
+        first_player.name = "software engineer".to_string();
+        <PlayerV2 as Crud<B>>::update(&first_player, conn).unwrap();
+        let p2 = <PlayerV2 as Crud<B>>::read(conn, first_player.id)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_player, p2);
+
+        <PlayerV2 as Crud<B>>::delete(first_player, conn).unwrap();
+        let players = <PlayerV2 as Crud<B>>::read(conn, p2.id)
+            .unwrap()
+            .map(|p| p.unwrap())
+            .collect::<Vec<_>>();
+        assert!(players.is_empty());
+    }
+
+    fn test_migrate<'a, B: MigrateEntireTable>(
+        mk_connection: impl Fn(&str) -> <B as CrudBackend>::Connection<'a>,
+    ) where
+        PlayerV1: Crud<B>,
+        PlayerV2: Crud<B>,
+        PlayerV3: Crud<B>,
+    {
         let _ = env_logger::builder()
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
             .try_init();
 
-        log::debug!("migration setup");
-        let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir.path().join("data.db");
-        let connection = sqlite::open(path).unwrap();
-        let path = tempdir.path().join("data_v3.db");
-        let connection_v3 = sqlite::open(path).unwrap();
         log::debug!("creating tables");
-        PlayerV1::create(&connection).unwrap();
-        PlayerV2::create(&connection).unwrap();
-        PlayerV3::create(&connection_v3).unwrap();
+        <PlayerV1 as Crud<B>>::create((mk_connection)("playerv1")).unwrap();
+        <PlayerV2 as Crud<B>>::create((mk_connection)("playerv2")).unwrap();
+        <PlayerV3 as Crud<B>>::create((mk_connection)("playerv3")).unwrap();
 
         log::debug!("populating v1");
         let players_v1 = (0..100)
@@ -646,7 +657,7 @@ mod test {
             })
             .collect::<Vec<_>>();
         for player in players_v1.iter() {
-            player.insert(&connection).unwrap();
+            <PlayerV1 as Crud<B>>::insert(player, (mk_connection)("playerv1")).unwrap();
         }
         let players_v3 = players_v1
             .iter()
@@ -656,42 +667,88 @@ mod test {
             .collect::<Vec<_>>();
 
         log::debug!("running forward migrations");
-        let migrations = Migrations::<PlayerV1, Sqlite>::default()
+        let migrations = Migrations::<PlayerV1, B>::default()
             .with_version::<PlayerV2>()
             .with_version::<Player>();
-        migrations
-            .run_with(|table| match table {
-                "playerv3" => &connection_v3,
-                _ => &connection,
-            })
-            .unwrap();
+        migrations.run_with(&mk_connection).unwrap();
 
-        let players_v1_from_db = PlayerV1::read_all(&connection)
+        let players_v1_from_db = <PlayerV1 as Crud<B>>::read_all((mk_connection)("playerv1"))
             .unwrap()
             .map(|r| r.unwrap())
             .collect::<Vec<_>>();
         assert_eq!(Vec::<PlayerV1>::new(), players_v1_from_db);
 
-        let players_v3_from_db = PlayerV3::read_all(&connection_v3)
+        let players_v3_from_db = <PlayerV3 as Crud<B>>::read_all((mk_connection)("playerv3"))
             .unwrap()
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
         assert_eq!(players_v3, players_v3_from_db);
 
         log::debug!("running reverse migrations");
-        let migrations = Migrations::<Player, Sqlite>::default()
+        let migrations = Migrations::<Player, B>::default()
             .with_version::<PlayerV2>()
             .with_version::<PlayerV1>();
-        migrations
-            .run_with(|table| match table {
-                "playerv3" => &connection_v3,
-                _ => &connection,
-            })
-            .unwrap();
-        let players_v1_from_db = PlayerV1::read_all(&connection)
+        migrations.run_with(&mk_connection).unwrap();
+
+        let players_v1_from_db = <PlayerV1 as Crud<B>>::read_all((mk_connection)("playerv1"))
             .unwrap()
             .map(|r| r.unwrap())
             .collect::<Vec<_>>();
         assert_eq!(players_v1, players_v1_from_db);
+    }
+
+    #[cfg(feature = "backend_sqlite")]
+    mod sqlite_tests {
+        use super::*;
+        use crate::Sqlite;
+
+        #[test]
+        fn p1_crud() {
+            let conn = sqlite::open(":memory:").unwrap();
+            test_p1_crud::<Sqlite>(&conn);
+        }
+
+        #[test]
+        fn p2_crud() {
+            let conn = sqlite::open(":memory:").unwrap();
+            test_p2_crud::<Sqlite>(&conn);
+        }
+
+        #[test]
+        fn migrate() {
+            let tempdir = tempfile::tempdir().unwrap();
+            let path = tempdir.path().join("data.db");
+            let connection = sqlite::open(path).unwrap();
+            let path = tempdir.path().join("data_v3.db");
+            let connection_v3 = sqlite::open(path).unwrap();
+            test_migrate::<Sqlite>(|table| match table {
+                "playerv3" => &connection_v3,
+                _ => &connection,
+            });
+        }
+    }
+
+    #[cfg(feature = "backend_toml")]
+    mod toml_tests {
+        use super::*;
+        use crate::Toml;
+
+        #[test]
+        fn p1_crud() {
+            let tempdir = tempfile::tempdir().unwrap();
+            test_p1_crud::<Toml>(tempdir.path());
+        }
+
+        #[test]
+        fn p2_crud() {
+            let tempdir = tempfile::tempdir().unwrap();
+            test_p2_crud::<Toml>(tempdir.path());
+        }
+
+        #[test]
+        fn migrate() {
+            let tempdir = tempfile::tempdir().unwrap();
+            test_migrate::<Toml>(|_| tempdir.path());
+        }
     }
 }

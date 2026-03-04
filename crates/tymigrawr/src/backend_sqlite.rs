@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use snafu::{OptionExt, ResultExt};
 
 use crate::{
-    Crud, CrudField, HasCrudFields, IsCrudField, MigrateEntireTable, Migration, Value, ValueType,
+    Crud, CrudBackend, CrudField, HasCrudFields, IsCrudField, MigrateEntireTable, Migration, Value,
+    ValueType,
 };
 
 impl CrudField {
@@ -54,13 +55,12 @@ impl From<sqlite::Value> for Value {
 }
 
 impl MigrateEntireTable for Sqlite {
-    type Connection<'a> = &'a sqlite::Connection;
-
     fn read_all_values<'a>(
         connection: &'a sqlite::Connection,
         table_name: &'a str,
-        column_names: Vec<&'a str>,
+        fields: Vec<CrudField>,
     ) -> Result<Vec<Result<HashMap<&'a str, Value>, snafu::Whatever>>, snafu::Whatever> {
+        let column_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         let statement = format!("SELECT * FROM {table_name};");
         let query = connection
             .prepare(statement)
@@ -111,7 +111,7 @@ impl MigrateEntireTable for Sqlite {
     }
 
     fn delete_all(
-        connection: Self::Connection<'_>,
+        connection: &sqlite::Connection,
         table_name: &str,
     ) -> Result<(), snafu::Whatever> {
         let statement = format!("DELETE FROM {table_name};");
@@ -125,9 +125,11 @@ impl MigrateEntireTable for Sqlite {
 
 pub struct Sqlite;
 
-impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
+impl CrudBackend for Sqlite {
     type Connection<'a> = &'a sqlite::Connection;
+}
 
+impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     /// Create a table for `Self`.
     fn create(connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
         let table_name = Self::table_name();
@@ -150,14 +152,10 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     }
 
     fn read_all<'a>(
-        connection: Self::Connection<'a>,
+        connection: <Sqlite as CrudBackend>::Connection<'a>,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
         let table_name = Self::table_name();
-        let column_names = Self::crud_fields()
-            .iter()
-            .map(|field| field.name)
-            .collect::<Vec<_>>();
-        let cursor = Sqlite::read_all_values(connection, table_name, column_names)?;
+        let cursor = Sqlite::read_all_values(connection, table_name, Self::crud_fields())?;
         Ok(Box::new(
             cursor
                 .into_iter()
@@ -202,10 +200,10 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     }
 
     fn read<'a, Key: IsCrudField>(
-        connection: Self::Connection<'a>,
+        connection: <Sqlite as CrudBackend>::Connection<'a>,
         key: Key,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
-        Self::read_where(connection, Self::primary_key_name(), "=", key)
+        <Self as Crud<Sqlite>>::read_where(connection, Self::primary_key_name(), "=", key)
     }
 
     fn update(&self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
