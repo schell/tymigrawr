@@ -214,6 +214,46 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
         Toml::insert_fields(connection, table_name, &fields)
     }
 
+    fn upsert(&self, connection: &Path) -> Result<bool, snafu::Whatever> {
+        let table_name = Self::table_name();
+        let path = table_path(connection, table_name);
+        let crud_fields = Self::crud_fields();
+        let pk_name = Self::primary_key_name();
+        let new_fields = self.as_crud_fields();
+        let pk_value = new_fields
+            .get(pk_name)
+            .whatever_context("missing primary key value for upsert")?;
+
+        let mut rows = read_rows(&path)?;
+        let pk_field = crud_fields
+            .iter()
+            .find(|f| f.name == pk_name)
+            .whatever_context("primary key field not in schema")?;
+
+        let mut found = false;
+        for row in rows.iter_mut() {
+            let matches = match row.get(pk_name) {
+                Some(tv) => {
+                    let row_val = toml_to_value(tv, &pk_field.ty).unwrap_or(Value::None);
+                    &row_val == pk_value
+                }
+                None => false,
+            };
+            if matches {
+                *row = fields_to_row(&new_fields);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            rows.push(fields_to_row(&new_fields));
+        }
+
+        write_rows(&path, &rows)?;
+        Ok(true)
+    }
+
     fn read_all<'a>(
         connection: <Toml as CrudBackend>::Connection<'a>,
     ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {

@@ -118,7 +118,7 @@ impl MigrateEntireTable for Sqlite {
         let mut query = connection
             .prepare(&statement)
             .whatever_context("prepare clear table")?;
-        while let Ok(_) = query.next() {}
+        while query.next().is_ok() {}
         Ok(())
     }
 }
@@ -149,6 +149,69 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
         let fields = self.as_crud_fields();
         Sqlite::insert_fields(connection, table_name, &fields)?;
         Ok(())
+    }
+
+    fn upsert(&self, connection: &sqlite::Connection) -> Result<bool, snafu::Whatever> {
+        let table_name = Self::table_name();
+        let crud_fields = Self::crud_fields();
+        let field_values = self.as_crud_fields();
+
+        let columns = crud_fields
+            .iter()
+            .map(|f| f.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let binds = crud_fields
+            .iter()
+            .map(|f| format!(":{}", f.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let primary_key = crud_fields
+            .iter()
+            .find(|f| f.primary_key)
+            .or_else(|| crud_fields.first())
+            .map(|f| f.name)
+            .whatever_context("must have at least one field")?;
+
+        let update_set = crud_fields
+            .iter()
+            .filter(|f| f.name != primary_key)
+            .map(|f| format!("{} = excluded.{}", f.name, f.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let statement = if update_set.is_empty() {
+            // Only a primary key column — nothing to update, just ignore conflicts
+            format!(
+                "INSERT INTO {table_name} ({columns}) VALUES ({binds}) \
+                 ON CONFLICT({primary_key}) DO NOTHING"
+            )
+        } else {
+            format!(
+                "INSERT INTO {table_name} ({columns}) VALUES ({binds}) \
+                 ON CONFLICT({primary_key}) DO UPDATE SET {update_set}"
+            )
+        };
+
+        let mut query = connection
+            .prepare(&statement)
+            .whatever_context("upsert prepare")?;
+
+        for (key, value) in field_values.into_iter() {
+            let bind_key = format!(":{key}");
+            let v = sqlite::Value::from(value);
+            query
+                .bind((bind_key.as_str(), v))
+                .whatever_context("upsert bind")?;
+        }
+
+        snafu::ensure_whatever!(
+            matches!(query.next(), Ok(sqlite::State::Done)),
+            "upsert query not ok"
+        );
+
+        Ok(connection.change_count() > 0)
     }
 
     fn read_all<'a>(
@@ -312,4 +375,28 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             }),
         }
     }
+}
+
+pub fn try_from_row<T: Crud<Sqlite>>(stmt: &sqlite::Statement<'_>) -> Result<T, snafu::Whatever> {
+    let mut crud_fields = HashMap::default();
+    for field in T::crud_fields() {
+        crud_fields.insert(
+            field.name,
+            match field.ty {
+                ValueType::Integer => {
+                    Value::Integer(stmt.read(field.name).whatever_context("could not read")?)
+                }
+                ValueType::Float => {
+                    Value::Float(stmt.read(field.name).whatever_context("could not read")?)
+                }
+                ValueType::String => {
+                    Value::String(stmt.read(field.name).whatever_context("could not read")?)
+                }
+                ValueType::Bytes => {
+                    Value::Bytes(stmt.read(field.name).whatever_context("could not read")?)
+                }
+            },
+        );
+    }
+    T::try_from_crud_fields(&crud_fields)
 }

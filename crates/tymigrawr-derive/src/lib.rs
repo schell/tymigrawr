@@ -5,6 +5,16 @@ use syn::{
     WherePredicate,
 };
 
+/// Returns `true` if the type looks like `Option<...>`.
+fn is_option_type(ty: &Type) -> bool {
+    if let Type::Path(ref tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            return seg.ident == "Option";
+        }
+    }
+    false
+}
+
 fn get_fields(ast: &Data) -> (Vec<Ident>, Vec<Type>, Vec<Vec<Attribute>>) {
     let fields = match *ast {
         Data::Struct(DataStruct {
@@ -36,6 +46,10 @@ fn gen_crud_fields(
                 .map(|id| format!("{}", id));
             let mut extras = vec![];
             for att in atts {
+                #[expect(
+                    clippy::single_match,
+                    reason = "We keep this here for extensibility sake"
+                )]
                 match att.as_str() {
                     "primary_key" => {
                         extras.push(quote! {
@@ -46,7 +60,7 @@ fn gen_crud_fields(
                 }
             }
             quote! {
-                let mut #ident = #ty::field();
+                let mut #ident = <#ty>::field();
                 #ident.name = stringify!(#ident);
                 #(#extras)*
                 #ident
@@ -75,7 +89,10 @@ fn get_primary_key(
     };
 
     if let Some(ident) = may_ident {
-        (quote! {stringify!(#ident)}, quote! {self.#ident.into_value()})
+        (
+            quote! {stringify!(#ident)},
+            quote! {self.#ident.into_value()},
+        )
     } else {
         (
             quote! {
@@ -91,12 +108,24 @@ fn gen_from_crud_fields(idents: &[Ident], tys: &[Type]) -> Vec<proc_macro2::Toke
         .iter()
         .zip(tys.iter())
         .map(|(ident, ty)| {
-            quote! {
-                let #ident = fields
-                    .get(stringify!(#ident))
-                    .whatever_context(concat!("missing ", stringify!(#ident)))?;
-                let #ident = #ty::maybe_from_value(#ident)
-                    .whatever_context(concat!("convert ", stringify!(#ident)))?;
+            if is_option_type(ty) {
+                // For Option<T> fields, `maybe_from_value` returns `Option<T>` directly
+                // (it delegates to T::maybe_from_value which returns Option<T>).
+                // We use that value as-is — None means NULL, Some(v) means a value.
+                quote! {
+                    let #ident = match fields.get(stringify!(#ident)) {
+                        Some(v) => <#ty>::maybe_from_value(v),
+                        None => None,
+                    };
+                }
+            } else {
+                quote! {
+                    let #ident = fields
+                        .get(stringify!(#ident))
+                        .whatever_context(concat!("missing ", stringify!(#ident)))?;
+                    let #ident = <#ty>::maybe_from_value(#ident)
+                        .whatever_context(concat!("convert ", stringify!(#ident)))?;
+                }
             }
         })
         .collect()

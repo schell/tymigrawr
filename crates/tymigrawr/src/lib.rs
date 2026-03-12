@@ -115,6 +115,7 @@ pub trait IsCrudField: Sized {
     type MaybeSelf;
 
     fn field() -> CrudField;
+    #[allow(clippy::wrong_self_convention)]
     fn into_value(&self) -> Value;
     fn maybe_from_value(value: &Value) -> Self::MaybeSelf;
 }
@@ -178,6 +179,27 @@ impl IsCrudField for u32 {
     fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
         let i = value.as_i64().whatever_context("not an integer")?;
         u32::try_from(i).whatever_context("can't u32 from i64")
+    }
+}
+
+impl IsCrudField for bool {
+    type MaybeSelf = Option<Self>;
+
+    fn field() -> CrudField {
+        CrudField {
+            ty: ValueType::Integer,
+            ..Default::default()
+        }
+    }
+
+    fn into_value(&self) -> Value {
+        let i: i64 = if *self { 1 } else { 0 };
+        i.into()
+    }
+
+    fn maybe_from_value(value: &Value) -> Option<Self> {
+        let i = value.as_i64()?;
+        Some(i != 0)
     }
 }
 
@@ -286,13 +308,23 @@ pub trait HasCrudFields: Sized {
     fn try_from_crud_fields(fields: &HashMap<&str, Value>) -> Result<Self, snafu::Whatever>;
 }
 
+type FromPrevious =
+    Box<dyn Fn(Box<dyn core::any::Any + 'static>) -> Box<dyn core::any::Any + 'static> + 'static>;
+
+type AsCrudFields =
+    Box<dyn for<'a> Fn(&'a Box<dyn core::any::Any + 'static>) -> HashMap<&'a str, Value> + 'static>;
+
+type TryFromCrudFields = Box<
+    dyn Fn(&HashMap<&str, Value>) -> Result<Box<dyn core::any::Any + 'static>, snafu::Whatever>
+        + 'static,
+>;
+
 pub struct Migration {
     table_name: Box<dyn Fn() -> &'static str>,
     crud_fields: Box<dyn Fn() -> Vec<CrudField>>,
-    from_prev: Box<dyn Fn(Box<dyn core::any::Any>) -> Box<dyn core::any::Any>>,
-    as_crud_fields: Box<dyn Fn(&Box<dyn core::any::Any>) -> HashMap<&str, Value>>,
-    try_from_crud_fields:
-        Box<dyn Fn(&HashMap<&str, Value>) -> Result<Box<dyn core::any::Any>, snafu::Whatever>>,
+    from_prev: FromPrevious,
+    as_crud_fields: AsCrudFields,
+    try_from_crud_fields: TryFromCrudFields,
 }
 
 pub trait CrudBackend {
@@ -308,6 +340,11 @@ where
     fn create(connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
 
     fn insert(&self, connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
+
+    /// Insert the row, or update all non-primary-key columns if a row with
+    /// the same primary key already exists.  Returns `true` when at least one
+    /// row was inserted or updated.
+    fn upsert(&self, connection: Backend::Connection<'_>) -> Result<bool, snafu::Whatever>;
 
     fn read_all<'a>(
         connection: Backend::Connection<'a>,
@@ -357,12 +394,14 @@ where
     }
 }
 
+type ReadResult<'a> = Result<HashMap<&'a str, Value>, snafu::Whatever>;
+
 pub trait MigrateEntireTable: CrudBackend {
     fn read_all_values<'a>(
         connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
         fields: Vec<CrudField>,
-    ) -> Result<Vec<Result<HashMap<&'a str, Value>, snafu::Whatever>>, snafu::Whatever>;
+    ) -> Result<Vec<ReadResult<'a>>, snafu::Whatever>;
 
     fn insert_fields(
         connection: <Self as CrudBackend>::Connection<'_>,
@@ -382,16 +421,20 @@ pub struct Migrations<T, Backend> {
 }
 
 impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
-    Migrations<T, Backend>
+    Default for Migrations<T, Backend>
 {
-    pub fn default() -> Self {
+    fn default() -> Self {
         Self {
             _current: PhantomData,
             all: Default::default(),
         }
         .with_version::<T>()
     }
+}
 
+impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
+    Migrations<T, Backend>
+{
     pub fn with_version<Next>(self) -> Migrations<Next, Backend>
     where
         Next: From<T> + Crud<Backend> + HasCrudFields + Clone + Sized + 'static,
@@ -601,6 +644,51 @@ mod test {
         assert!(players.is_empty());
     }
 
+    fn test_upsert<B: CrudBackend>(conn: B::Connection<'_>)
+    where
+        PlayerV1: Crud<B>,
+    {
+        <PlayerV1 as Crud<B>>::create(conn).unwrap();
+
+        // Upsert a new row — should insert and return true
+        let player = PlayerV1 {
+            id: 42,
+            name: "original".to_string(),
+        };
+        let changed = <PlayerV1 as Crud<B>>::upsert(&player, conn).unwrap();
+        assert!(changed, "upsert of new row should return true");
+
+        // Read it back
+        let from_db = <PlayerV1 as Crud<B>>::read(conn, 42)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(player, from_db);
+
+        // Upsert with same PK but different data — should update and return true
+        let updated = PlayerV1 {
+            id: 42,
+            name: "updated".to_string(),
+        };
+        let changed = <PlayerV1 as Crud<B>>::upsert(&updated, conn).unwrap();
+        assert!(changed, "upsert of existing row should return true");
+
+        // Read it back and verify update took effect
+        let from_db = <PlayerV1 as Crud<B>>::read(conn, 42)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated, from_db);
+
+        // Verify only one row exists with that key
+        let all = <PlayerV1 as Crud<B>>::read(conn, 42)
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(1, all.len(), "upsert should not duplicate rows");
+    }
+
     fn test_p2_crud<B: CrudBackend>(conn: B::Connection<'_>)
     where
         PlayerV2: Crud<B>,
@@ -715,6 +803,12 @@ mod test {
         }
 
         #[test]
+        fn upsert() {
+            let conn = sqlite::open(":memory:").unwrap();
+            test_upsert::<Sqlite>(&conn);
+        }
+
+        #[test]
         fn migrate() {
             let tempdir = tempfile::tempdir().unwrap();
             let path = tempdir.path().join("data.db");
@@ -743,6 +837,12 @@ mod test {
         fn p2_crud() {
             let tempdir = tempfile::tempdir().unwrap();
             test_p2_crud::<Toml>(tempdir.path());
+        }
+
+        #[test]
+        fn upsert() {
+            let tempdir = tempfile::tempdir().unwrap();
+            test_upsert::<Toml>(tempdir.path());
         }
 
         #[test]
