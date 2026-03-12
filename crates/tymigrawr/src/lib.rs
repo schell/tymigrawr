@@ -594,6 +594,22 @@ mod test {
 
     pub type Player = PlayerV3;
 
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct Color {
+        pub name: String,
+        pub hex: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, HasCrudFields)]
+    pub struct Palette {
+        #[primary_key]
+        pub id: i64,
+        #[json_text]
+        pub colors: Vec<Color>,
+        #[json_text]
+        pub metadata: Option<Vec<String>>,
+    }
+
     fn test_p1_crud<B: CrudBackend>(conn: B::Connection<'_>)
     where
         PlayerV1: Crud<B>,
@@ -687,6 +703,81 @@ mod test {
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(1, all.len(), "upsert should not duplicate rows");
+    }
+
+    fn test_json_text<B: CrudBackend>(conn: B::Connection<'_>)
+    where
+        Palette: Crud<B>,
+    {
+        <Palette as Crud<B>>::create(conn).unwrap();
+
+        // Insert a palette with colors and Some metadata
+        let palette = Palette {
+            id: 1,
+            colors: vec![
+                Color {
+                    name: "red".into(),
+                    hex: 0xFF0000,
+                },
+                Color {
+                    name: "green".into(),
+                    hex: 0x00FF00,
+                },
+            ],
+            metadata: Some(vec!["warm".into(), "nature".into()]),
+        };
+        <Palette as Crud<B>>::insert(&palette, conn).unwrap();
+
+        // Read it back and verify round-trip
+        let from_db = <Palette as Crud<B>>::read(conn, 1)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(palette, from_db);
+
+        // Insert a palette with None metadata
+        let palette_no_meta = Palette {
+            id: 2,
+            colors: vec![Color {
+                name: "blue".into(),
+                hex: 0x0000FF,
+            }],
+            metadata: None,
+        };
+        <Palette as Crud<B>>::insert(&palette_no_meta, conn).unwrap();
+
+        let from_db = <Palette as Crud<B>>::read(conn, 2)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(palette_no_meta, from_db);
+
+        // Upsert the first palette with updated colors
+        let updated = Palette {
+            id: 1,
+            colors: vec![Color {
+                name: "purple".into(),
+                hex: 0x800080,
+            }],
+            metadata: None,
+        };
+        <Palette as Crud<B>>::upsert(&updated, conn).unwrap();
+
+        let from_db = <Palette as Crud<B>>::read(conn, 1)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated, from_db);
+
+        // Verify read_all returns both palettes
+        let all = <Palette as Crud<B>>::read_all(conn)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(2, all.len());
     }
 
     fn test_p2_crud<B: CrudBackend>(conn: B::Connection<'_>)
@@ -809,6 +900,12 @@ mod test {
         }
 
         #[test]
+        fn json_text() {
+            let conn = sqlite::open(":memory:").unwrap();
+            test_json_text::<Sqlite>(&conn);
+        }
+
+        #[test]
         fn migrate() {
             let tempdir = tempfile::tempdir().unwrap();
             let path = tempdir.path().join("data.db");
@@ -843,6 +940,12 @@ mod test {
         fn upsert() {
             let tempdir = tempfile::tempdir().unwrap();
             test_upsert::<Toml>(tempdir.path());
+        }
+
+        #[test]
+        fn json_text() {
+            let tempdir = tempfile::tempdir().unwrap();
+            test_json_text::<Toml>(tempdir.path());
         }
 
         #[test]

@@ -15,6 +15,16 @@ fn is_option_type(ty: &Type) -> bool {
     false
 }
 
+/// Returns `true` if the field's attributes contain `#[json_text]`.
+fn has_json_text_attr(atts: &[Attribute]) -> bool {
+    atts.iter().any(|att| {
+        att.path
+            .get_ident()
+            .map(|id| id == "json_text")
+            .unwrap_or(false)
+    })
+}
+
 fn get_fields(ast: &Data) -> (Vec<Ident>, Vec<Type>, Vec<Vec<Attribute>>) {
     let fields = match *ast {
         Data::Struct(DataStruct {
@@ -40,12 +50,13 @@ fn gen_crud_fields(
         .iter()
         .zip(tys.iter().zip(atts))
         .map(|(ident, (ty, atts))| {
-            let atts = atts
+            let is_json = has_json_text_attr(atts);
+            let att_strs = atts
                 .iter()
                 .filter_map(|att| att.path.get_ident())
                 .map(|id| format!("{}", id));
             let mut extras = vec![];
-            for att in atts {
+            for att in att_strs {
                 #[expect(
                     clippy::single_match,
                     reason = "We keep this here for extensibility sake"
@@ -59,11 +70,27 @@ fn gen_crud_fields(
                     _ => {}
                 }
             }
-            quote! {
-                let mut #ident = <#ty>::field();
-                #ident.name = stringify!(#ident);
-                #(#extras)*
-                #ident
+            if is_json {
+                // json_text fields are stored as TEXT — the field type does not
+                // implement IsCrudField, so we build the CrudField directly.
+                let nullable = is_option_type(ty);
+                quote! {
+                    let mut #ident = tymigrawr::CrudField {
+                        ty: tymigrawr::ValueType::String,
+                        nullable: #nullable,
+                        ..Default::default()
+                    };
+                    #ident.name = stringify!(#ident);
+                    #(#extras)*
+                    #ident
+                }
+            } else {
+                quote! {
+                    let mut #ident = <#ty>::field();
+                    #ident.name = stringify!(#ident);
+                    #(#extras)*
+                    #ident
+                }
             }
         })
         .collect()
@@ -103,15 +130,53 @@ fn get_primary_key(
     }
 }
 
-fn gen_from_crud_fields(idents: &[Ident], tys: &[Type]) -> Vec<proc_macro2::TokenStream> {
+fn gen_from_crud_fields(
+    idents: &[Ident],
+    tys: &[Type],
+    atts: &[Vec<Attribute>],
+) -> Vec<proc_macro2::TokenStream> {
     idents
         .iter()
-        .zip(tys.iter())
-        .map(|(ident, ty)| {
-            if is_option_type(ty) {
-                // For Option<T> fields, `maybe_from_value` returns `Option<T>` directly
-                // (it delegates to T::maybe_from_value which returns Option<T>).
-                // We use that value as-is — None means NULL, Some(v) means a value.
+        .zip(tys.iter().zip(atts))
+        .map(|(ident, (ty, field_atts))| {
+            let is_json = has_json_text_attr(field_atts);
+            let is_option = is_option_type(ty);
+
+            if is_json && is_option {
+                // Option<T> + json_text: tolerate NULL/missing, deserialize
+                // the inner type from JSON when present.
+                let deser_msg = format!("deserialize json_text {}", ident);
+                let expected_msg = format!("expected string for json_text {}", ident);
+                quote! {
+                    let #ident = match fields.get(stringify!(#ident)) {
+                        Some(tymigrawr::Value::String(s)) => {
+                            Some(
+                                serde_json::from_str(s)
+                                    .whatever_context(#deser_msg)?,
+                            )
+                        }
+                        Some(tymigrawr::Value::None) | None => None,
+                        _ => snafu::whatever!(#expected_msg),
+                    };
+                }
+            } else if is_json {
+                // Required json_text field: deserialize from Value::String.
+                let missing_msg = format!("missing {}", ident);
+                let deser_msg = format!("deserialize json_text {}", ident);
+                let expected_msg = format!("expected string for json_text {}", ident);
+                quote! {
+                    let #ident = match fields
+                        .get(stringify!(#ident))
+                        .whatever_context(#missing_msg)?
+                    {
+                        tymigrawr::Value::String(s) => {
+                            serde_json::from_str::<#ty>(s)
+                                .whatever_context(#deser_msg)?
+                        }
+                        _ => snafu::whatever!(#expected_msg),
+                    };
+                }
+            } else if is_option {
                 quote! {
                     let #ident = match fields.get(stringify!(#ident)) {
                         Some(v) => <#ty>::maybe_from_value(v),
@@ -131,32 +196,93 @@ fn gen_from_crud_fields(idents: &[Ident], tys: &[Type]) -> Vec<proc_macro2::Toke
         .collect()
 }
 
+/// Generates per-field serialization expressions for `as_crud_fields()`.
+fn gen_as_crud_field_pairs(
+    idents: &[Ident],
+    tys: &[Type],
+    atts: &[Vec<Attribute>],
+) -> Vec<proc_macro2::TokenStream> {
+    idents
+        .iter()
+        .zip(tys.iter().zip(atts))
+        .map(|(ident, (ty, field_atts))| {
+            let is_json = has_json_text_attr(field_atts);
+            let is_option = is_option_type(ty);
+            if is_json && is_option {
+                // Option<T> json_text: None → Value::None, Some(v) → JSON string
+                quote! {
+                    (
+                        stringify!(#ident),
+                        match &self.#ident {
+                            Some(inner) => tymigrawr::Value::String(
+                                serde_json::to_string(inner)
+                                    .expect(concat!(
+                                        "failed to serialize json_text field ",
+                                        stringify!(#ident),
+                                    )),
+                            ),
+                            None => tymigrawr::Value::None,
+                        },
+                    )
+                }
+            } else if is_json {
+                quote! {
+                    (
+                        stringify!(#ident),
+                        tymigrawr::Value::String(
+                            serde_json::to_string(&self.#ident)
+                                .expect(concat!(
+                                    "failed to serialize json_text field ",
+                                    stringify!(#ident),
+                                )),
+                        ),
+                    )
+                }
+            } else {
+                quote! {
+                    (stringify!(#ident), self.#ident.into_value())
+                }
+            }
+        })
+        .collect()
+}
+
 /// Macro for deriving structs that have normal CRUD-worthy fields.
-#[proc_macro_derive(HasCrudFields, attributes(primary_key))]
+#[proc_macro_derive(HasCrudFields, attributes(primary_key, json_text))]
 pub fn derive_crud_fields(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = syn::parse_macro_input!(input);
     let name = input.ident;
     let (field_idents, field_tys, field_atts) = get_fields(&input.data);
     let mut generics = input.generics;
     {
-        /// Adds a `HasCrudFields` constraint on each of the field types.
-        fn constrain_field_types(clause: &mut WhereClause, tys: &[Type]) {
-            for ty in tys.iter() {
-                let where_predicate: WherePredicate =
-                    syn::parse_quote!(#ty : tymigrawr::IsCrudField);
-                clause.predicates.push(where_predicate);
+        /// Adds trait constraints on each of the field types.
+        ///
+        /// Normal fields get `IsCrudField`; `#[json_text]` fields get
+        /// `serde::Serialize + serde::de::DeserializeOwned`.
+        fn constrain_field_types(clause: &mut WhereClause, tys: &[Type], atts: &[Vec<Attribute>]) {
+            for (ty, field_atts) in tys.iter().zip(atts) {
+                if has_json_text_attr(field_atts) {
+                    let where_predicate: WherePredicate =
+                        syn::parse_quote!(#ty : serde::Serialize + serde::de::DeserializeOwned);
+                    clause.predicates.push(where_predicate);
+                } else {
+                    let where_predicate: WherePredicate =
+                        syn::parse_quote!(#ty : tymigrawr::IsCrudField);
+                    clause.predicates.push(where_predicate);
+                }
             }
         }
 
         let where_clause = generics.make_where_clause();
-        constrain_field_types(where_clause, &field_tys)
+        constrain_field_types(where_clause, &field_tys, &field_atts)
     }
 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let table_name = name.to_string().to_ascii_lowercase();
     let crud_fields = gen_crud_fields(&field_idents, &field_tys, &field_atts);
-    let from_crud_fields = gen_from_crud_fields(&field_idents, &field_tys);
+    let from_crud_fields = gen_from_crud_fields(&field_idents, &field_tys, &field_atts);
+    let as_crud_field_pairs = gen_as_crud_field_pairs(&field_idents, &field_tys, &field_atts);
     let (primary_key, primary_key_val) = get_primary_key(&field_idents, &field_atts);
     let output = quote! {
         #[automatically_derived]
@@ -173,7 +299,7 @@ pub fn derive_crud_fields(input: proc_macro::TokenStream) -> proc_macro::TokenSt
 
             fn as_crud_fields(&self) -> std::collections::HashMap<&str, tymigrawr::Value> {
                 std::collections::HashMap::from_iter([
-                    #((stringify!(#field_idents), self.#field_idents.into_value())),*
+                    #(#as_crud_field_pairs),*
                 ])
             }
 
