@@ -610,6 +610,15 @@ mod test {
         pub metadata: Option<Vec<String>>,
     }
 
+    #[derive(Debug, Clone, PartialEq, HasCrudFields)]
+    pub struct SettingsV1 {
+        #[primary_key]
+        pub id: i64,
+        pub api_key: Option<String>,
+        pub token: Option<String>,
+        pub timeout_secs: i64,
+    }
+
     fn test_p1_crud<B: CrudBackend>(conn: B::Connection<'_>)
     where
         PlayerV1: Crud<B>,
@@ -903,6 +912,61 @@ mod test {
         fn json_text() {
             let conn = sqlite::open(":memory:").unwrap();
             test_json_text::<Sqlite>(&conn);
+        }
+
+        #[test]
+        fn try_from_row_with_nullable_fields() {
+            let conn = sqlite::open(":memory:").unwrap();
+            <SettingsV1 as Crud<Sqlite>>::create(&conn).unwrap();
+
+            // Insert a row with NULL Option fields
+            let settings = SettingsV1 {
+                id: 1,
+                api_key: None,
+                token: None,
+                timeout_secs: 60,
+            };
+            <SettingsV1 as Crud<Sqlite>>::insert(&settings, &conn).unwrap();
+
+            // Now try to read it back using try_from_row
+            let mut stmt = conn
+                .prepare("SELECT * FROM settingsv1 WHERE id = 1")
+                .unwrap();
+            assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+            let loaded = crate::try_from_row::<SettingsV1>(&stmt).unwrap();
+            assert_eq!(settings, loaded);
+
+            // Insert another row with Some values
+            let settings2 = SettingsV1 {
+                id: 2,
+                api_key: Some("secret-key".to_string()),
+                token: Some("auth-token".to_string()),
+                timeout_secs: 120,
+            };
+            <SettingsV1 as Crud<Sqlite>>::insert(&settings2, &conn).unwrap();
+
+            let mut stmt = conn
+                .prepare("SELECT * FROM settingsv1 WHERE id = 2")
+                .unwrap();
+            assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+            let loaded = crate::try_from_row::<SettingsV1>(&stmt).unwrap();
+            assert_eq!(settings2, loaded);
+
+            // Insert row with mixed Some/None
+            let settings3 = SettingsV1 {
+                id: 3,
+                api_key: Some("key-only".to_string()),
+                token: None,
+                timeout_secs: 90,
+            };
+            <SettingsV1 as Crud<Sqlite>>::insert(&settings3, &conn).unwrap();
+
+            let mut stmt = conn
+                .prepare("SELECT * FROM settingsv1 WHERE id = 3")
+                .unwrap();
+            assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+            let loaded = crate::try_from_row::<SettingsV1>(&stmt).unwrap();
+            assert_eq!(settings3, loaded);
         }
 
         #[test]

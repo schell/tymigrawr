@@ -382,18 +382,45 @@ pub fn try_from_row<T: Crud<Sqlite>>(stmt: &sqlite::Statement<'_>) -> Result<T, 
     for field in T::crud_fields() {
         crud_fields.insert(
             field.name,
-            match field.ty {
-                ValueType::Integer => {
-                    Value::Integer(stmt.read(field.name).whatever_context("could not read")?)
+            if field.nullable {
+                // For nullable fields, try to read as Option<T> to properly handle NULL
+                match field.ty {
+                    ValueType::Integer => {
+                        let val: Option<i64> =
+                            stmt.read(field.name).whatever_context("could not read")?;
+                        Value::from(val)
+                    }
+                    ValueType::Float => {
+                        let val: Option<f64> =
+                            stmt.read(field.name).whatever_context("could not read")?;
+                        Value::from(val)
+                    }
+                    ValueType::String => {
+                        let val: Option<String> =
+                            stmt.read(field.name).whatever_context("could not read")?;
+                        Value::from(val)
+                    }
+                    ValueType::Bytes => {
+                        let val: Option<Vec<u8>> =
+                            stmt.read(field.name).whatever_context("could not read")?;
+                        Value::from(val)
+                    }
                 }
-                ValueType::Float => {
-                    Value::Float(stmt.read(field.name).whatever_context("could not read")?)
-                }
-                ValueType::String => {
-                    Value::String(stmt.read(field.name).whatever_context("could not read")?)
-                }
-                ValueType::Bytes => {
-                    Value::Bytes(stmt.read(field.name).whatever_context("could not read")?)
+            } else {
+                // For non-nullable fields, read directly
+                match field.ty {
+                    ValueType::Integer => {
+                        Value::Integer(stmt.read(field.name).whatever_context("could not read")?)
+                    }
+                    ValueType::Float => {
+                        Value::Float(stmt.read(field.name).whatever_context("could not read")?)
+                    }
+                    ValueType::String => {
+                        Value::String(stmt.read(field.name).whatever_context("could not read")?)
+                    }
+                    ValueType::Bytes => {
+                        Value::Bytes(stmt.read(field.name).whatever_context("could not read")?)
+                    }
                 }
             },
         );
