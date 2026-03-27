@@ -619,6 +619,20 @@ mod test {
         pub timeout_secs: i64,
     }
 
+    #[derive(Debug, Clone, PartialEq, HasCrudFields)]
+    pub struct AutoIncrementModel {
+        #[primary_key(auto_increment)]
+        pub id: i64,
+        pub name: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, HasCrudFields)]
+    pub struct AutoIncrementModelI32 {
+        #[primary_key(auto_increment)]
+        pub id: i32,
+        pub name: String,
+    }
+
     fn test_p1_crud<B: CrudBackend>(conn: B::Connection<'_>)
     where
         PlayerV1: Crud<B>,
@@ -712,6 +726,80 @@ mod test {
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(1, all.len(), "upsert should not duplicate rows");
+    }
+
+    fn test_auto_increment<B: CrudBackend>(conn: B::Connection<'_>)
+    where
+        AutoIncrementModel: Crud<B>,
+    {
+        <AutoIncrementModel as Crud<B>>::create(conn).unwrap();
+
+        // Verify that the id field has auto_increment enabled
+        let crud_fields = <AutoIncrementModel as HasCrudFields>::crud_fields();
+        let id_field = crud_fields
+            .iter()
+            .find(|f| f.name == "id")
+            .expect("id field should exist");
+        assert!(
+            id_field.primary_key,
+            "id field should be marked as primary key"
+        );
+        assert!(
+            id_field.auto_increment,
+            "id field should be marked as auto_increment"
+        );
+
+        // Insert a record with auto_increment
+        let record = AutoIncrementModel {
+            id: 0,
+            name: "test".to_string(),
+        };
+        <AutoIncrementModel as Crud<B>>::insert(&record, conn).unwrap();
+
+        // Read it back to verify it was created
+        let from_db = <AutoIncrementModel as Crud<B>>::read(conn, 0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db.name, "test");
+    }
+
+    fn test_auto_increment_i32<B: CrudBackend>(conn: B::Connection<'_>)
+    where
+        AutoIncrementModelI32: Crud<B>,
+    {
+        <AutoIncrementModelI32 as Crud<B>>::create(conn).unwrap();
+
+        // Verify that the id field has auto_increment enabled (i32 variant)
+        let crud_fields = <AutoIncrementModelI32 as HasCrudFields>::crud_fields();
+        let id_field = crud_fields
+            .iter()
+            .find(|f| f.name == "id")
+            .expect("id field should exist");
+        assert!(
+            id_field.primary_key,
+            "id field should be marked as primary key"
+        );
+        assert!(
+            id_field.auto_increment,
+            "id field should be marked as auto_increment for i32 type"
+        );
+
+        // Insert a record with auto_increment
+        let record = AutoIncrementModelI32 {
+            id: 0,
+            name: "test i32".to_string(),
+        };
+        <AutoIncrementModelI32 as Crud<B>>::insert(&record, conn).unwrap();
+
+        // Read it back to verify it was created
+        let from_db = <AutoIncrementModelI32 as Crud<B>>::read(conn, 0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db.name, "test i32");
     }
 
     fn test_json_text<B: CrudBackend>(conn: B::Connection<'_>)
@@ -967,6 +1055,18 @@ mod test {
             assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
             let loaded = crate::try_from_row::<SettingsV1>(&stmt).unwrap();
             assert_eq!(settings3, loaded);
+        }
+
+        #[test]
+        fn auto_increment() {
+            let conn = sqlite::open(":memory:").unwrap();
+            test_auto_increment::<Sqlite>(&conn);
+        }
+
+        #[test]
+        fn auto_increment_i32() {
+            let conn = sqlite::open(":memory:").unwrap();
+            test_auto_increment_i32::<Sqlite>(&conn);
         }
 
         #[test]

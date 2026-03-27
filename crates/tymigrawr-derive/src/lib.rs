@@ -25,6 +25,35 @@ fn has_json_text_attr(atts: &[Attribute]) -> bool {
     })
 }
 
+/// Checks if an attribute is `#[primary_key(...)]` and returns whether it has `auto_increment`.
+fn parse_primary_key_attr(att: &Attribute) -> Option<bool> {
+    if let Some(ident) = att.path.get_ident() {
+        if ident == "primary_key" {
+            // Parse the attribute to check for (auto_increment) parameter
+            if att.tokens.is_empty() {
+                // #[primary_key] with no parameters
+                return Some(false);
+            }
+            // Try to parse (auto_increment) or similar
+            let tokens_str = att.tokens.to_string();
+            // Check if tokens contain "auto_increment"
+            return Some(tokens_str.contains("auto_increment"));
+        }
+    }
+    None
+}
+
+/// Returns `true` if the field type is an integer type (i64 or i32).
+fn is_integer_type(ty: &Type) -> bool {
+    if let Type::Path(ref tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            let ident_str = format!("{}", seg.ident);
+            return ident_str == "i64" || ident_str == "i32";
+        }
+    }
+    false
+}
+
 fn get_fields(ast: &Data) -> (Vec<Ident>, Vec<Type>, Vec<Vec<Attribute>>) {
     let fields = match *ast {
         Data::Struct(DataStruct {
@@ -51,25 +80,34 @@ fn gen_crud_fields(
         .zip(tys.iter().zip(atts))
         .map(|(ident, (ty, atts))| {
             let is_json = has_json_text_attr(atts);
-            let att_strs = atts
-                .iter()
-                .filter_map(|att| att.path.get_ident())
-                .map(|id| format!("{}", id));
-            let mut extras = vec![];
-            for att in att_strs {
-                #[expect(
-                    clippy::single_match,
-                    reason = "We keep this here for extensibility sake"
-                )]
-                match att.as_str() {
-                    "primary_key" => {
-                        extras.push(quote! {
-                            #ident.primary_key = true;
-                        });
+            let mut has_primary_key = false;
+            let mut has_auto_increment = false;
+
+            for att in atts {
+                if let Some(auto_inc) = parse_primary_key_attr(att) {
+                    has_primary_key = true;
+                    has_auto_increment = auto_inc;
+                    // Validate: auto_increment only on integer types
+                    if has_auto_increment && !is_integer_type(ty) {
+                        return quote! {
+                            compile_error!("auto_increment is only supported on integer types (i64, i32)");
+                        };
                     }
-                    _ => {}
                 }
             }
+
+            let mut extras = vec![];
+            if has_primary_key {
+                extras.push(quote! {
+                    #ident.primary_key = true;
+                });
+            }
+            if has_auto_increment {
+                extras.push(quote! {
+                    #ident.auto_increment = true;
+                });
+            }
+
             if is_json {
                 // json_text fields are stored as TEXT — the field type does not
                 // implement IsCrudField, so we build the CrudField directly.
@@ -102,8 +140,7 @@ fn get_primary_key(
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
     let mut keys = idents.iter().zip(atts).filter_map(|(ident, atts)| {
         for att in atts.iter() {
-            let att = att.path.get_ident()?;
-            if format!("{}", att) == "primary_key" {
+            if parse_primary_key_attr(att).is_some() {
                 return Some(ident.clone());
             }
         }
