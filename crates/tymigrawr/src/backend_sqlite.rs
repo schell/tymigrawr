@@ -1,11 +1,9 @@
 //! Sqlite impl.
 use std::collections::HashMap;
 
-use snafu::{OptionExt, ResultExt};
-
 use crate::{
-    Crud, CrudBackend, CrudField, HasCrudFields, IsCrudField, MigrateEntireTable, Migration, Value,
-    ValueType,
+    error::TymResult, Crud, CrudBackend, CrudField, Error, HasCrudFields, HasCrudFieldsError,
+    IsCrudField, MigrateEntireTable, Migration, Value, ValueType,
 };
 
 impl CrudField {
@@ -56,20 +54,20 @@ impl From<sqlite::Value> for Value {
 
 impl MigrateEntireTable for Sqlite {
     fn read_all_values<'a>(
-        connection: &'a sqlite::Connection,
+        connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
         fields: Vec<CrudField>,
-    ) -> Result<Vec<Result<HashMap<&'a str, Value>, snafu::Whatever>>, snafu::Whatever> {
+    ) -> TymResult<Vec<crate::ReadResult<'a, Self::Error>>, Self::Error> {
         let column_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         let statement = format!("SELECT * FROM {table_name};");
         let query = connection
             .prepare(statement)
-            .whatever_context("read all prepare")?;
+            .map_err(|e| Error::Sqlite { source: e })?;
         let cursor = query
             .into_iter()
             .map(
-                move |row| -> Result<HashMap<&str, Value>, snafu::Whatever> {
-                    let row = row.whatever_context("row")?;
+                move |row| -> Result<HashMap<&str, Value>, Error<<Sqlite as CrudBackend>::Error>> {
+                    let row = row?;
                     let mut cols = HashMap::default();
                     for name in column_names.iter() {
                         let value = &row[*name];
@@ -86,7 +84,7 @@ impl MigrateEntireTable for Sqlite {
         connection: &sqlite::Connection,
         table_name: &str,
         fields: &HashMap<&str, Value>,
-    ) -> Result<(), snafu::Whatever> {
+    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let columns = fields.iter().map(|f| *f.0).collect::<Vec<_>>().join(", ");
         let binds = fields
             .iter()
@@ -96,28 +94,32 @@ impl MigrateEntireTable for Sqlite {
         let statement = format!("INSERT INTO {table_name} ({columns}) VALUES ({binds});");
         let mut query = connection
             .prepare(&statement)
-            .whatever_context(format!("insert prepare: {statement}"))?;
+            .map_err(|e| Error::Sqlite { source: e })?;
         for (key, value) in fields.iter() {
             let key = format!(":{key}");
             let k = key.as_str();
             let value = sqlite::Value::from(value.clone());
-            query.bind((k, value)).whatever_context("insert bind")?;
+            query.bind((k, value))?;
         }
-        snafu::ensure_whatever!(
-            matches!(query.next(), Ok(sqlite::State::Done)),
-            "insert query not ok"
-        );
+
+        let state = query.next()?;
+        if !matches!(state, sqlite::State::Done) {
+            return Err(Error::OperationFailed {
+                operation: "insert".to_string(),
+                reason: "query not ok".to_string(),
+            });
+        }
         Ok(())
     }
 
     fn delete_all(
         connection: &sqlite::Connection,
         table_name: &str,
-    ) -> Result<(), snafu::Whatever> {
+    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let statement = format!("DELETE FROM {table_name};");
         let mut query = connection
             .prepare(&statement)
-            .whatever_context("prepare clear table")?;
+            .map_err(|e| Error::Sqlite { source: e })?;
         while query.next().is_ok() {}
         Ok(())
     }
@@ -127,11 +129,14 @@ pub struct Sqlite;
 
 impl CrudBackend for Sqlite {
     type Connection<'a> = &'a sqlite::Connection;
+    type Error = sqlite::Error;
 }
 
 impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     /// Create a table for `Self`.
-    fn create(connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
+    fn create(
+        connection: &sqlite::Connection,
+    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let fields: String = Self::crud_fields()
             .iter()
@@ -141,17 +146,23 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
         let statement = format!("CREATE TABLE IF NOT EXISTS {table_name} ({fields});");
         connection
             .execute(statement)
-            .whatever_context("could not create")
+            .map_err(|e| Error::Sqlite { source: e })
     }
 
-    fn insert(&self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
+    fn insert(
+        &self,
+        connection: &sqlite::Connection,
+    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let fields = self.as_crud_fields();
         Sqlite::insert_fields(connection, table_name, &fields)?;
         Ok(())
     }
 
-    fn upsert(&self, connection: &sqlite::Connection) -> Result<bool, snafu::Whatever> {
+    fn upsert(
+        &self,
+        connection: &sqlite::Connection,
+    ) -> Result<bool, Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let crud_fields = Self::crud_fields();
         let field_values = self.as_crud_fields();
@@ -172,7 +183,10 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             .find(|f| f.primary_key)
             .or_else(|| crud_fields.first())
             .map(|f| f.name)
-            .whatever_context("must have at least one field")?;
+            .ok_or_else(|| Error::OperationFailed {
+                operation: "update".into(),
+                reason: "no primary key field".into(),
+            })?;
 
         let update_set = crud_fields
             .iter()
@@ -196,34 +210,37 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
 
         let mut query = connection
             .prepare(&statement)
-            .whatever_context("upsert prepare")?;
+            .map_err(|e| Error::Sqlite { source: e })?;
 
         for (key, value) in field_values.into_iter() {
             let bind_key = format!(":{key}");
             let v = sqlite::Value::from(value);
             query
                 .bind((bind_key.as_str(), v))
-                .whatever_context("upsert bind")?;
+                .map_err(|e| Error::Sqlite { source: e })?;
         }
 
-        snafu::ensure_whatever!(
-            matches!(query.next(), Ok(sqlite::State::Done)),
-            "upsert query not ok"
-        );
+        if !matches!(query.next(), Ok(sqlite::State::Done)) {
+            return Err(Error::OperationFailed {
+                operation: "upsert".into(),
+                reason: "query not ok".into(),
+            });
+        }
 
         Ok(connection.change_count() > 0)
     }
 
     fn read_all<'a>(
         connection: <Sqlite as CrudBackend>::Connection<'a>,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
+    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, sqlite::Error>> + 'a>, sqlite::Error>
+    {
         let table_name = Self::table_name();
         let cursor = Sqlite::read_all_values(connection, table_name, Self::crud_fields())?;
-        Ok(Box::new(
-            cursor
-                .into_iter()
-                .map(|cols| Self::try_from_crud_fields(&cols?)),
-        ))
+        Ok(Box::new(cursor.into_iter().map(|cols| {
+            let cols = cols?;
+            let value = Self::try_from_crud_fields(&cols)?;
+            Ok(value)
+        })))
     }
 
     fn read_where<'a>(
@@ -231,7 +248,10 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
         key_name: &'a str,
         comparison: &'a str,
         key_value: impl IsCrudField,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
+    ) -> TymResult<
+        Box<dyn Iterator<Item = TymResult<Self, sqlite::Error>> + 'a>,
+        <Sqlite as CrudBackend>::Error,
+    > {
         let table_name = Self::table_name();
         let column_names = Self::crud_fields()
             .iter()
@@ -241,23 +261,23 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             format!("SELECT * FROM {table_name} WHERE {key_name} {comparison} :key_value");
         let mut query = connection
             .prepare(statement)
-            .whatever_context("create prepare")?;
+            .map_err(|e| Error::Sqlite { source: e })?;
         let value = key_value.into_value();
         let value = sqlite::Value::from(value);
         query
             .bind((":key_value", value))
-            .whatever_context("create bind")?;
+            .map_err(|e| Error::Sqlite { source: e })?;
         let cursor = query
             .into_iter()
-            .map(move |row| -> Result<Self, snafu::Whatever> {
-                let row = row.whatever_context("row")?;
+            .map(move |row| -> TymResult<Self, sqlite::Error> {
+                let row = row.map_err(|e| Error::Sqlite { source: e })?;
                 let mut cols = HashMap::default();
                 for name in column_names.iter() {
                     let value = &row[*name];
                     let value = Value::from(value.clone());
                     cols.insert(*name, value);
                 }
-                Self::try_from_crud_fields(&cols)
+                Ok(Self::try_from_crud_fields(&cols)?)
             });
         Ok(Box::new(cursor))
     }
@@ -265,11 +285,20 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     fn read<'a, Key: IsCrudField>(
         connection: <Sqlite as CrudBackend>::Connection<'a>,
         key: Key,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
-        <Self as Crud<Sqlite>>::read_where(connection, Self::primary_key_name(), "=", key)
+    ) -> TymResult<
+        Box<dyn Iterator<Item = TymResult<Self, <Sqlite as CrudBackend>::Error>> + 'a>,
+        <Sqlite as CrudBackend>::Error,
+    > {
+        let iterator =
+            <Self as Crud<Sqlite>>::read_where(connection, Self::primary_key_name(), "=", key)?;
+        Ok(iterator
+            as Box<dyn Iterator<Item = TymResult<Self, <Sqlite as CrudBackend>::Error>> + 'a>)
     }
 
-    fn update(&self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
+    fn update(
+        &self,
+        connection: &sqlite::Connection,
+    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let fields = self.as_crud_fields();
         let mut primary_key: Option<&str> = None;
         let values = Self::crud_fields()
@@ -284,14 +313,17 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let primary_key = primary_key.whatever_context("missing primary key")?;
+        let primary_key = primary_key.ok_or_else(|| Error::OperationFailed {
+            operation: "update".into(),
+            reason: "no primary key field".into(),
+        })?;
 
         let table_name = Self::table_name();
         let statement =
             format!("UPDATE {table_name} SET {values} WHERE {primary_key} = :key_value",);
         let mut query = connection
             .prepare(statement)
-            .whatever_context("update prepare")?;
+            .map_err(|e| Error::Sqlite { source: e })?;
         let mut key_value = None;
         for (key, value) in fields.into_iter() {
             if key == primary_key {
@@ -301,24 +333,35 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             let key = format!(":{key}");
             let k = key.as_str();
             let v = sqlite::Value::from(value);
-            query.bind((k, v)).whatever_context("update bind")?;
+            query
+                .bind((k, v))
+                .map_err(|e| Error::Sqlite { source: e })?;
         }
-        let key_value = key_value.whatever_context("no key value")?;
+        let key_value = key_value.ok_or_else(|| Error::OperationFailed {
+            operation: "delete".into(),
+            reason: "no key value".into(),
+        })?;
         let key_value = sqlite::Value::from(key_value);
         query
             .bind((":key_value", key_value))
-            .whatever_context("update bind key_value")?;
+            .map_err(|e| Error::Sqlite { source: e })?;
 
         if let Ok(sqlite::State::Done) = query.next() {
             Ok(())
         } else {
-            snafu::whatever!("update next")
+            Err(Error::OperationFailed {
+                operation: "update".into(),
+                reason: "no rows updated".into(),
+            })
         }?;
 
         Ok(())
     }
 
-    fn delete(self, connection: &sqlite::Connection) -> Result<(), snafu::Whatever> {
+    fn delete(
+        self,
+        connection: &sqlite::Connection,
+    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let key_name = Self::crud_fields()
             .into_iter()
@@ -329,27 +372,33 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
                     None
                 }
             })
-            .whatever_context("missing primary key")?;
+            .ok_or_else(|| Error::OperationFailed {
+                operation: "delete".into(),
+                reason: "no primary key field".into(),
+            })?;
         let key_value = self
             .as_crud_fields()
             .into_iter()
             .find_map(|(k, v)| if k == key_name { Some(v) } else { None })
-            .whatever_context("missing primary key value")?;
+            .ok_or_else(|| Error::OperationFailed {
+                operation: "delete".into(),
+                reason: "no key value".into(),
+            })?;
         let key_value = sqlite::Value::from(key_value);
         let statement =
             format!("DELETE FROM {table_name} WHERE {key_name} = :key_value RETURNING *");
         let mut query = connection
             .prepare(statement)
-            .whatever_context("delete prepare")?;
+            .map_err(|e| Error::Sqlite { source: e })?;
         query
             .bind((":key_value", key_value))
-            .whatever_context("delete bind key_value")?;
+            .map_err(|e| Error::Sqlite { source: e })?;
         while let Ok(sqlite::State::Row) = query.next() {}
 
         Ok(())
     }
 
-    fn migration<S: 'static>() -> Migration
+    fn migration<S: 'static>() -> Migration<sqlite::Error>
     where
         Self: From<S>,
     {
@@ -377,7 +426,9 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     }
 }
 
-pub fn try_from_row<T: Crud<Sqlite>>(stmt: &sqlite::Statement<'_>) -> Result<T, snafu::Whatever> {
+pub fn try_from_row<T: Crud<Sqlite>>(
+    stmt: &sqlite::Statement<'_>,
+) -> Result<T, HasCrudFieldsError> {
     let mut crud_fields = HashMap::default();
     for field in T::crud_fields() {
         crud_fields.insert(
@@ -386,23 +437,19 @@ pub fn try_from_row<T: Crud<Sqlite>>(stmt: &sqlite::Statement<'_>) -> Result<T, 
                 // For nullable fields, try to read as Option<T> to properly handle NULL
                 match field.ty {
                     ValueType::Integer => {
-                        let val: Option<i64> =
-                            stmt.read(field.name).whatever_context("could not read")?;
+                        let val: Option<i64> = stmt.read(field.name).ok();
                         Value::from(val)
                     }
                     ValueType::Float => {
-                        let val: Option<f64> =
-                            stmt.read(field.name).whatever_context("could not read")?;
+                        let val: Option<f64> = stmt.read(field.name).ok();
                         Value::from(val)
                     }
                     ValueType::String => {
-                        let val: Option<String> =
-                            stmt.read(field.name).whatever_context("could not read")?;
+                        let val: Option<String> = stmt.read(field.name).ok();
                         Value::from(val)
                     }
                     ValueType::Bytes => {
-                        let val: Option<Vec<u8>> =
-                            stmt.read(field.name).whatever_context("could not read")?;
+                        let val: Option<Vec<u8>> = stmt.read(field.name).ok();
                         Value::from(val)
                     }
                 }
@@ -410,16 +457,36 @@ pub fn try_from_row<T: Crud<Sqlite>>(stmt: &sqlite::Statement<'_>) -> Result<T, 
                 // For non-nullable fields, read directly
                 match field.ty {
                     ValueType::Integer => {
-                        Value::Integer(stmt.read(field.name).whatever_context("could not read")?)
+                        Value::Integer(stmt.read(field.name).ok().ok_or_else(|| {
+                            HasCrudFieldsError {
+                                value: Value::None,
+                                reason: format!("could not read field {}", field.name),
+                            }
+                        })?)
                     }
                     ValueType::Float => {
-                        Value::Float(stmt.read(field.name).whatever_context("could not read")?)
+                        Value::Float(stmt.read(field.name).ok().ok_or_else(|| {
+                            HasCrudFieldsError {
+                                value: Value::None,
+                                reason: format!("could not read field {}", field.name),
+                            }
+                        })?)
                     }
                     ValueType::String => {
-                        Value::String(stmt.read(field.name).whatever_context("could not read")?)
+                        Value::String(stmt.read(field.name).ok().ok_or_else(|| {
+                            HasCrudFieldsError {
+                                value: Value::None,
+                                reason: format!("could not read field {}", field.name),
+                            }
+                        })?)
                     }
                     ValueType::Bytes => {
-                        Value::Bytes(stmt.read(field.name).whatever_context("could not read")?)
+                        Value::Bytes(stmt.read(field.name).ok().ok_or_else(|| {
+                            HasCrudFieldsError {
+                                value: Value::None,
+                                reason: format!("could not read field {}", field.name),
+                            }
+                        })?)
                     }
                 }
             },

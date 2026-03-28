@@ -182,35 +182,43 @@ fn gen_from_crud_fields(
             if is_json && is_option {
                 // Option<T> + json_text: tolerate NULL/missing, deserialize
                 // the inner type from JSON when present.
-                let deser_msg = format!("deserialize json_text {}", ident);
-                let expected_msg = format!("expected string for json_text {}", ident);
                 quote! {
                     let #ident = match fields.get(stringify!(#ident)) {
                         Some(tymigrawr::Value::String(s)) => {
                             Some(
                                 serde_json::from_str(s)
-                                    .whatever_context(#deser_msg)?,
+                                    .map_err(|_| tymigrawr::HasCrudFieldsError {
+                                        value: tymigrawr::Value::String(s.clone()),
+                                        reason: format!("deserialize json_text {}", stringify!(#ident)),
+                                    })?
                             )
                         }
                         Some(tymigrawr::Value::None) | None => None,
-                        _ => snafu::whatever!(#expected_msg),
+                        val => {
+                            return Err(tymigrawr::HasCrudFieldsError {
+                                value: val.cloned().unwrap_or(tymigrawr::Value::None),
+                                reason: format!("expected string for json_text {}", stringify!(#ident)),
+                            })
+                        }
                     };
                 }
             } else if is_json {
                 // Required json_text field: deserialize from Value::String.
-                let missing_msg = format!("missing {}", ident);
-                let deser_msg = format!("deserialize json_text {}", ident);
-                let expected_msg = format!("expected string for json_text {}", ident);
                 quote! {
-                    let #ident = match fields
-                        .get(stringify!(#ident))
-                        .whatever_context(#missing_msg)?
-                    {
-                        tymigrawr::Value::String(s) => {
+                    let #ident = match fields.get(stringify!(#ident)) {
+                        Some(tymigrawr::Value::String(s)) => {
                             serde_json::from_str::<#ty>(s)
-                                .whatever_context(#deser_msg)?
+                                .map_err(|_| tymigrawr::HasCrudFieldsError {
+                                    value: tymigrawr::Value::String(s.clone()),
+                                    reason: format!("deserialize json_text {}", stringify!(#ident)),
+                                })?
                         }
-                        _ => snafu::whatever!(#expected_msg),
+                        val => {
+                            return Err(tymigrawr::HasCrudFieldsError {
+                                value: val.cloned().unwrap_or(tymigrawr::Value::None),
+                                reason: format!("expected string for json_text {}", stringify!(#ident)),
+                            })
+                        }
                     };
                 }
             } else if is_option {
@@ -221,12 +229,23 @@ fn gen_from_crud_fields(
                     };
                 }
             } else {
+                let ident_value = quote::format_ident!("__value_{}", ident);
                 quote! {
-                    let #ident = fields
+                    let #ident_value = fields
                         .get(stringify!(#ident))
-                        .whatever_context(concat!("missing ", stringify!(#ident)))?;
-                    let #ident = <#ty>::maybe_from_value(#ident)
-                        .whatever_context(concat!("convert ", stringify!(#ident)))?;
+                        .ok_or_else(|| tymigrawr::HasCrudFieldsError {
+                            value: tymigrawr::Value::None,
+                            reason: format!("missing required field {}", stringify!(#ident)),
+                        })?;
+                    let #ident = match <#ty>::maybe_from_value(#ident_value) {
+                        Some(v) => v,
+                        None => {
+                            return Err(tymigrawr::HasCrudFieldsError {
+                                value: #ident_value.clone(),
+                                reason: format!("failed to deserialize field {}", stringify!(#ident)),
+                            })
+                        }
+                    };
                 }
             }
         })
@@ -350,7 +369,7 @@ pub fn derive_crud_fields(input: proc_macro::TokenStream) -> proc_macro::TokenSt
 
             fn try_from_crud_fields(
                 fields: &std::collections::HashMap<&str, tymigrawr::Value>,
-            ) -> Result<Self, snafu::Whatever> {
+            ) -> core::result::Result<Self, tymigrawr::HasCrudFieldsError> {
                 #(#from_crud_fields)*
                 Ok(Self{
                     #(#field_idents),*

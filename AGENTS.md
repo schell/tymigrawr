@@ -116,13 +116,11 @@ the same line (K&R / Rust default).
 
 ### Error Handling
 
-This project uses **`snafu ^0.7`** with the `Whatever` catch-all error type — no custom
-error enums are defined.
+This project uses **`snafu 0.8`** with the custom error enums.
 
-- Return `Result<..., snafu::Whatever>` from public trait methods (fully qualified path).
-- Use `.whatever_context("descriptive message")` on `Result` and `Option`.
-- Use `snafu::ensure_whatever!(condition, "message")` for assertions.
-- Use `snafu::whatever!("message")` for immediate error returns.
+- Return `Result<..., Error<E>>` from public trait methods (fully qualified path).
+- Use `.context(*Snafu)` on `Result` and `Option`.
+- Use `snafu::ensure!(condition, *Snafu{...})` for assertions.
 - Import via `use snafu::prelude::*;` or selectively `use snafu::{OptionExt, ResultExt};`.
 
 ### Derives and Attributes

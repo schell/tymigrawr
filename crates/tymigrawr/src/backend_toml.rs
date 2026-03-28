@@ -12,9 +12,10 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use snafu::{OptionExt, ResultExt};
+use snafu::prelude::*;
 
 use crate::{
+    error::{DomainError, Error, TymResult},
     Crud, CrudBackend, CrudField, HasCrudFields, IsCrudField, MigrateEntireTable, Migration, Value,
     ValueType,
 };
@@ -63,18 +64,15 @@ fn toml_to_value(tv: &toml::Value, vt: &ValueType) -> Option<Value> {
 /// Read all rows from a table's TOML file.
 ///
 /// Returns an empty vec if the file does not exist.
-fn read_rows(path: &Path) -> Result<Vec<toml::value::Table>, snafu::Whatever> {
+fn read_rows(path: &Path) -> TymResult<Vec<toml::value::Table>, TomlError> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content =
-        fs::read_to_string(path).whatever_context(format!("read table file {:?}", path))?;
+    let content = fs::read_to_string(path).context(IoSnafu)?;
     if content.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let doc: toml::Value = content
-        .parse()
-        .whatever_context(format!("parse TOML from {:?}", path))?;
+    let doc: toml::Value = content.parse().context(DeserializationSnafu)?;
     let rows = doc
         .get("row")
         .and_then(|v| v.as_array())
@@ -88,15 +86,16 @@ fn read_rows(path: &Path) -> Result<Vec<toml::value::Table>, snafu::Whatever> {
 }
 
 /// Write rows to a table's TOML file as `[[row]]` entries.
-fn write_rows(path: &Path, rows: &[toml::value::Table]) -> Result<(), snafu::Whatever> {
+fn write_rows(path: &Path, rows: &[toml::value::Table]) -> Result<(), TomlError> {
     let mut doc = toml::value::Table::new();
     let arr = rows
         .iter()
         .map(|r| toml::Value::Table(r.clone()))
         .collect::<Vec<_>>();
     doc.insert("row".to_string(), toml::Value::Array(arr));
-    let content = toml::to_string_pretty(&doc).whatever_context("serialize TOML")?;
-    fs::write(path, content).whatever_context(format!("write table file {:?}", path))
+    let content = toml::to_string_pretty(&doc).context(SerializationSnafu)?;
+    fs::write(path, content).context(IoSnafu)?;
+    Ok(())
 }
 
 /// Convert a `HashMap<&str, Value>` of field values into a TOML row table.
@@ -125,7 +124,7 @@ fn row_to_fields<'a>(row: &toml::value::Table, fields: &[CrudField]) -> HashMap<
 /// Compare two `Value`s using a SQL-style comparison operator.
 ///
 /// Supports `=`, `!=`, `<`, `>`, `<=`, `>=`.
-fn compare_values(lhs: &Value, comparison: &str, rhs: &Value) -> Result<bool, snafu::Whatever> {
+fn compare_values(lhs: &Value, comparison: &str, rhs: &Value) -> Result<bool, TomlError> {
     let ord = partial_cmp_values(lhs, rhs);
     match comparison {
         "=" => Ok(lhs == rhs),
@@ -134,7 +133,9 @@ fn compare_values(lhs: &Value, comparison: &str, rhs: &Value) -> Result<bool, sn
         ">" => Ok(ord.map(|o| o.is_gt()).unwrap_or(false)),
         "<=" => Ok(ord.map(|o| o.is_le()).unwrap_or(false)),
         ">=" => Ok(ord.map(|o| o.is_ge()).unwrap_or(false)),
-        _ => snafu::whatever!("unsupported comparison operator: {comparison}"),
+        _ => Err(TomlError::UnsupportedComparison {
+            operator: comparison.to_string(),
+        }),
     }
 }
 
@@ -153,8 +154,53 @@ fn partial_cmp_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
 /// TOML flat-file backend marker type.
 pub struct Toml;
 
+#[derive(Snafu, Debug)]
+pub enum TomlError {
+    #[snafu(display("Serialization error: {source}"))]
+    Serialization { source: toml::ser::Error },
+
+    #[snafu(display("Deserialization error: {source}"))]
+    Deserialization { source: toml::de::Error },
+
+    #[snafu(display("IO error: {source}"))]
+    Io { source: std::io::Error },
+
+    #[snafu(display("Unsupported comparison operator: {operator}"))]
+    UnsupportedComparison { operator: String },
+
+    #[snafu(display("Row not found: {context}"))]
+    RowNotFound { context: String },
+}
+
+impl From<toml::ser::Error> for TomlError {
+    fn from(source: toml::ser::Error) -> Self {
+        TomlError::Serialization { source }
+    }
+}
+
+impl From<toml::de::Error> for TomlError {
+    fn from(source: toml::de::Error) -> Self {
+        TomlError::Deserialization { source }
+    }
+}
+
+impl From<std::io::Error> for TomlError {
+    fn from(source: std::io::Error) -> Self {
+        TomlError::Io { source }
+    }
+}
+
+impl From<TomlError> for crate::Error<TomlError> {
+    fn from(inner: TomlError) -> Self {
+        crate::Error::Backend {
+            source: crate::error::DomainError { inner },
+        }
+    }
+}
+
 impl CrudBackend for Toml {
     type Connection<'a> = &'a Path;
+    type Error = TomlError;
 }
 
 impl MigrateEntireTable for Toml {
@@ -162,7 +208,7 @@ impl MigrateEntireTable for Toml {
         connection: &'a Path,
         table_name: &'a str,
         fields: Vec<CrudField>,
-    ) -> Result<Vec<Result<HashMap<&'a str, Value>, snafu::Whatever>>, snafu::Whatever> {
+    ) -> TymResult<Vec<crate::ReadResult<'a, Self::Error>>, Self::Error> {
         let path = table_path(connection, table_name);
         let rows = read_rows(&path)?;
         let result = rows
@@ -179,14 +225,15 @@ impl MigrateEntireTable for Toml {
         connection: &Path,
         table_name: &str,
         fields: &HashMap<&str, Value>,
-    ) -> Result<(), snafu::Whatever> {
+    ) -> TymResult<(), TomlError> {
         let path = table_path(connection, table_name);
         let mut rows = read_rows(&path)?;
         rows.push(fields_to_row(fields));
-        write_rows(&path, &rows)
+        write_rows(&path, &rows)?;
+        Ok(())
     }
 
-    fn delete_all(connection: &Path, table_name: &str) -> Result<(), snafu::Whatever> {
+    fn delete_all(connection: &Path, table_name: &str) -> TymResult<(), TomlError> {
         let path = table_path(connection, table_name);
         if path.exists() {
             write_rows(&path, &[])?;
@@ -198,9 +245,8 @@ impl MigrateEntireTable for Toml {
 impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
     /// Create the data directory (if needed) and an empty table file if it
     /// does not already exist.
-    fn create(connection: &Path) -> Result<(), snafu::Whatever> {
-        fs::create_dir_all(connection)
-            .whatever_context(format!("create data dir {:?}", connection))?;
+    fn create(connection: &Path) -> TymResult<(), TomlError> {
+        fs::create_dir_all(connection).context(IoSnafu)?;
         let path = table_path(connection, Self::table_name());
         if !path.exists() {
             write_rows(&path, &[])?;
@@ -208,27 +254,30 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
         Ok(())
     }
 
-    fn insert(&self, connection: &Path) -> Result<(), snafu::Whatever> {
+    fn insert(&self, connection: &Path) -> TymResult<(), TomlError> {
         let table_name = Self::table_name();
         let fields = self.as_crud_fields();
         Toml::insert_fields(connection, table_name, &fields)
     }
 
-    fn upsert(&self, connection: &Path) -> Result<bool, snafu::Whatever> {
+    fn upsert(&self, connection: &Path) -> TymResult<bool, TomlError> {
         let table_name = Self::table_name();
         let path = table_path(connection, table_name);
         let crud_fields = Self::crud_fields();
         let pk_name = Self::primary_key_name();
         let new_fields = self.as_crud_fields();
-        let pk_value = new_fields
-            .get(pk_name)
-            .whatever_context("missing primary key value for upsert")?;
+        let pk_value = new_fields.get(pk_name).context(RowNotFoundSnafu {
+            context: "missing primary key value for upsert".to_string(),
+        })?;
 
         let mut rows = read_rows(&path)?;
-        let pk_field = crud_fields
-            .iter()
-            .find(|f| f.name == pk_name)
-            .whatever_context("primary key field not in schema")?;
+        let pk_field =
+            crud_fields
+                .iter()
+                .find(|f| f.name == pk_name)
+                .context(RowNotFoundSnafu {
+                    context: "primary key field not in schema".to_string(),
+                })?;
 
         let mut found = false;
         for row in rows.iter_mut() {
@@ -256,14 +305,18 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
 
     fn read_all<'a>(
         connection: <Toml as CrudBackend>::Connection<'a>,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
+    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, TomlError>> + 'a>, TomlError> {
         let table_name = Self::table_name();
         let cursor = Toml::read_all_values(connection, table_name, Self::crud_fields())?;
-        Ok(Box::new(
-            cursor
-                .into_iter()
-                .map(|cols| Self::try_from_crud_fields(&cols?)),
-        ))
+        Ok(Box::new(cursor.into_iter().map(|cols| {
+            Self::try_from_crud_fields(&cols?).map_err(|_| Error::Backend {
+                source: DomainError {
+                    inner: TomlError::RowNotFound {
+                        context: "failed to deserialize row".to_string(),
+                    },
+                },
+            })
+        })))
     }
 
     fn read_where<'a>(
@@ -271,16 +324,24 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
         key_name: &'a str,
         comparison: &'a str,
         key_value: impl IsCrudField,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
+    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, TomlError>> + 'a>, TomlError> {
         let rhs = key_value.into_value();
         let cursor = Toml::read_all_values(connection, Self::table_name(), Self::crud_fields())?;
         let iter = cursor.into_iter().filter_map(move |cols| match cols {
             Ok(ref map) => {
                 let lhs = map.get(key_name)?;
                 match compare_values(lhs, comparison, &rhs) {
-                    Ok(true) => Some(Self::try_from_crud_fields(map)),
+                    Ok(true) => Some(Self::try_from_crud_fields(map).map_err(|_| Error::Backend {
+                        source: DomainError {
+                            inner: TomlError::RowNotFound {
+                                context: "failed to deserialize row".to_string(),
+                            },
+                        },
+                    })),
                     Ok(false) => None,
-                    Err(e) => Some(Err(e)),
+                    Err(e) => Some(Err(Error::Backend {
+                        source: DomainError { inner: e },
+                    })),
                 }
             }
             Err(e) => Some(Err(e)),
@@ -291,19 +352,19 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
     fn read<'a, Key: IsCrudField>(
         connection: <Toml as CrudBackend>::Connection<'a>,
         key: Key,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever> {
+    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, TomlError>> + 'a>, TomlError> {
         <Self as Crud<Toml>>::read_where(connection, Self::primary_key_name(), "=", key)
     }
 
-    fn update(&self, connection: &Path) -> Result<(), snafu::Whatever> {
+    fn update(&self, connection: &Path) -> TymResult<(), TomlError> {
         let table_name = Self::table_name();
         let path = table_path(connection, table_name);
         let crud_fields = Self::crud_fields();
         let pk_name = Self::primary_key_name();
         let new_fields = self.as_crud_fields();
-        let pk_value = new_fields
-            .get(pk_name)
-            .whatever_context("missing primary key value for update")?;
+        let pk_value = new_fields.get(pk_name).context(RowNotFoundSnafu {
+            context: "missing primary key value for update".to_string(),
+        })?;
 
         let mut rows = read_rows(&path)?;
         let mut found = false;
@@ -311,10 +372,11 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
             let row_pk = row.get(pk_name);
             let matches = match row_pk {
                 Some(tv) => {
-                    let pk_field = crud_fields
-                        .iter()
-                        .find(|f| f.name == pk_name)
-                        .whatever_context("primary key field not in schema")?;
+                    let pk_field = crud_fields.iter().find(|f| f.name == pk_name).context(
+                        RowNotFoundSnafu {
+                            context: "primary key field not in schema".to_string(),
+                        },
+                    )?;
                     let row_val = toml_to_value(tv, &pk_field.ty).unwrap_or(Value::None);
                     &row_val == pk_value
                 }
@@ -326,25 +388,34 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
                 break;
             }
         }
-        snafu::ensure_whatever!(found, "no row with matching primary key to update");
-        write_rows(&path, &rows)
+        snafu::ensure!(
+            found,
+            RowNotFoundSnafu {
+                context: "no row with matching primary key to update".to_string()
+            }
+        );
+        write_rows(&path, &rows)?;
+        Ok(())
     }
 
-    fn delete(self, connection: &Path) -> Result<(), snafu::Whatever> {
+    fn delete(self, connection: &Path) -> TymResult<(), TomlError> {
         let table_name = Self::table_name();
         let path = table_path(connection, table_name);
         let crud_fields = Self::crud_fields();
         let pk_name = Self::primary_key_name();
         let my_fields = self.as_crud_fields();
-        let pk_value = my_fields
-            .get(pk_name)
-            .whatever_context("missing primary key value for delete")?;
+        let pk_value = my_fields.get(pk_name).context(RowNotFoundSnafu {
+            context: "missing primary key value for delete".to_string(),
+        })?;
 
         let rows = read_rows(&path)?;
-        let pk_field = crud_fields
-            .iter()
-            .find(|f| f.name == pk_name)
-            .whatever_context("primary key field not in schema")?;
+        let pk_field =
+            crud_fields
+                .iter()
+                .find(|f| f.name == pk_name)
+                .context(RowNotFoundSnafu {
+                    context: "primary key field not in schema".to_string(),
+                })?;
         let remaining: Vec<_> = rows
             .into_iter()
             .filter(|row| match row.get(pk_name) {
@@ -355,10 +426,11 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
                 None => true,
             })
             .collect();
-        write_rows(&path, &remaining)
+        write_rows(&path, &remaining)?;
+        Ok(())
     }
 
-    fn migration<S: 'static>() -> Migration
+    fn migration<S: 'static>() -> Migration<TomlError>
     where
         Self: From<S>,
     {

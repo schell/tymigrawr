@@ -5,6 +5,8 @@ use std::{
 
 use snafu::prelude::*;
 
+pub mod error;
+pub use error::{Error, LibraryError};
 pub use tymigrawr_derive::HasCrudFields;
 
 #[cfg(feature = "backend_sqlite")]
@@ -16,6 +18,8 @@ pub use backend_sqlite::*;
 mod backend_toml;
 #[cfg(feature = "backend_toml")]
 pub use backend_toml::*;
+
+use crate::error::TymResult;
 
 #[derive(Default)]
 pub enum ValueType {
@@ -162,7 +166,7 @@ impl IsCrudField for i32 {
 }
 
 impl IsCrudField for u32 {
-    type MaybeSelf = Result<Self, snafu::Whatever>;
+    type MaybeSelf = Option<Self>;
 
     fn field() -> CrudField {
         CrudField {
@@ -177,8 +181,8 @@ impl IsCrudField for u32 {
     }
 
     fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        let i = value.as_i64().whatever_context("not an integer")?;
-        u32::try_from(i).whatever_context("can't u32 from i64")
+        let i = value.as_i64()?;
+        u32::try_from(i).ok()
     }
 }
 
@@ -299,13 +303,19 @@ impl<T: IsCrudField> IsCrudField for Option<T> {
     }
 }
 
+#[derive(Debug, Snafu)]
+pub struct HasCrudFieldsError {
+    pub value: Value,
+    pub reason: String,
+}
+
 pub trait HasCrudFields: Sized {
     fn table_name() -> &'static str;
     fn crud_fields() -> Vec<CrudField>;
     fn as_crud_fields(&self) -> HashMap<&str, Value>;
     fn primary_key_name() -> &'static str;
     fn primary_key_val(&self) -> Value;
-    fn try_from_crud_fields(fields: &HashMap<&str, Value>) -> Result<Self, snafu::Whatever>;
+    fn try_from_crud_fields(fields: &HashMap<&str, Value>) -> Result<Self, HasCrudFieldsError>;
 }
 
 type FromPrevious =
@@ -314,21 +324,20 @@ type FromPrevious =
 type AsCrudFields =
     Box<dyn for<'a> Fn(&'a Box<dyn core::any::Any + 'static>) -> HashMap<&'a str, Value> + 'static>;
 
-type TryFromCrudFields = Box<
-    dyn Fn(&HashMap<&str, Value>) -> Result<Box<dyn core::any::Any + 'static>, snafu::Whatever>
-        + 'static,
->;
+type TryFromCrudFields<E> =
+    Box<dyn Fn(&HashMap<&str, Value>) -> TymResult<Box<dyn core::any::Any + 'static>, E> + 'static>;
 
-pub struct Migration {
+pub struct Migration<E: core::fmt::Display + core::fmt::Debug + 'static> {
     table_name: Box<dyn Fn() -> &'static str>,
     crud_fields: Box<dyn Fn() -> Vec<CrudField>>,
     from_prev: FromPrevious,
     as_crud_fields: AsCrudFields,
-    try_from_crud_fields: TryFromCrudFields,
+    try_from_crud_fields: TryFromCrudFields<E>,
 }
 
 pub trait CrudBackend {
     type Connection<'a>: Copy;
+    type Error: core::fmt::Display + core::fmt::Debug + 'static;
 }
 
 pub trait Crud<Backend>
@@ -337,36 +346,51 @@ where
     Backend: CrudBackend,
 {
     /// Create a table for `Self`.
-    fn create(connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
+    fn create(connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
 
-    fn insert(&self, connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
+    fn insert(
+        &self,
+        connection: Backend::Connection<'_>,
+    ) -> std::result::Result<(), Error<Backend::Error>>;
 
     /// Insert the row, or update all non-primary-key columns if a row with
     /// the same primary key already exists.  Returns `true` when at least one
     /// row was inserted or updated.
-    fn upsert(&self, connection: Backend::Connection<'_>) -> Result<bool, snafu::Whatever>;
+    fn upsert(
+        &self,
+        connection: Backend::Connection<'_>,
+    ) -> std::result::Result<bool, Error<Backend::Error>>;
 
     fn read_all<'a>(
         connection: Backend::Connection<'a>,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever>;
+    ) -> std::result::Result<
+        Box<dyn Iterator<Item = TymResult<Self, Backend::Error>> + 'a>,
+        Error<Backend::Error>,
+    >;
 
     fn read_where<'a>(
         connection: Backend::Connection<'a>,
         key_name: &'a str,
         comparison: &'a str,
         key_value: impl IsCrudField,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever>;
+    ) -> std::result::Result<
+        Box<dyn Iterator<Item = TymResult<Self, Backend::Error>> + 'a>,
+        Error<Backend::Error>,
+    >;
 
     fn read<'a, Key: IsCrudField>(
         connection: Backend::Connection<'a>,
         key: Key,
-    ) -> Result<Box<dyn Iterator<Item = Result<Self, snafu::Whatever>> + 'a>, snafu::Whatever>;
+    ) -> std::result::Result<
+        Box<dyn Iterator<Item = TymResult<Self, Backend::Error>> + 'a>,
+        Error<Backend::Error>,
+    >;
 
-    fn update(&self, connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
+    fn update(&self, connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
 
-    fn delete(self, connection: Backend::Connection<'_>) -> Result<(), snafu::Whatever>;
+    fn delete(self, connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
 
-    fn migration<T: 'static>() -> Migration
+    fn migration<T: 'static>() -> Migration<Backend::Error>
     where
         Self: From<T>,
     {
@@ -394,30 +418,30 @@ where
     }
 }
 
-type ReadResult<'a> = Result<HashMap<&'a str, Value>, snafu::Whatever>;
+type ReadResult<'a, E> = TymResult<HashMap<&'a str, Value>, E>;
 
 pub trait MigrateEntireTable: CrudBackend {
     fn read_all_values<'a>(
         connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
         fields: Vec<CrudField>,
-    ) -> Result<Vec<ReadResult<'a>>, snafu::Whatever>;
+    ) -> TymResult<Vec<ReadResult<'a, Self::Error>>, Self::Error>;
 
     fn insert_fields(
         connection: <Self as CrudBackend>::Connection<'_>,
         table_name: &str,
         fields: &HashMap<&str, Value>,
-    ) -> Result<(), snafu::Whatever>;
+    ) -> TymResult<(), Self::Error>;
 
     fn delete_all(
         connection: <Self as CrudBackend>::Connection<'_>,
         table_name: &str,
-    ) -> Result<(), snafu::Whatever>;
+    ) -> TymResult<(), Self::Error>;
 }
 
-pub struct Migrations<T, Backend> {
+pub struct Migrations<T, Backend: CrudBackend> {
     _current: PhantomData<(T, Backend)>,
-    all: VecDeque<Migration>,
+    all: VecDeque<Migration<Backend::Error>>,
 }
 
 impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
@@ -453,14 +477,14 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
     pub fn run<'a>(
         self,
         connection: <Backend as CrudBackend>::Connection<'a>,
-    ) -> Result<(), snafu::Whatever> {
+    ) -> TymResult<(), Backend::Error> {
         self.run_with(|_| connection)
     }
 
     pub fn run_with<'a>(
         self,
         mk_connection: impl Fn(&str) -> <Backend as CrudBackend>::Connection<'a>,
-    ) -> Result<(), snafu::Whatever> {
+    ) -> TymResult<(), Backend::Error> {
         let Self { _current, mut all } = self;
         log::info!(
             "migrating {} versions of {:?}",
@@ -521,7 +545,6 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
 
 #[cfg(test)]
 mod test {
-    use snafu::prelude::*;
 
     use crate::{
         self as tymigrawr, Crud, CrudBackend, HasCrudFields, IsCrudField, MigrateEntireTable,
