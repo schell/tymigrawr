@@ -498,6 +498,56 @@ impl IsCrudField for AutoPrimaryKey<u32> {
     }
 }
 
+/// A JSON-serialized field. Any type implementing `serde::Serialize` and
+/// `serde::Deserialize` can be wrapped in `JsonText<T>` to be stored as JSON text in the database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonText<T> {
+    pub inner: T,
+}
+
+impl<T> JsonText<T> {
+    pub fn new(value: T) -> Self {
+        Self { inner: value }
+    }
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> IsCrudField for JsonText<T> {
+    type MaybeSelf = Option<Self>;
+
+    fn field() -> CrudField {
+        CrudField {
+            ty: ValueType::String,
+            ..Default::default()
+        }
+    }
+
+    fn into_value(&self) -> Value {
+        match serde_json::to_string(&self.inner) {
+            Ok(json) => Value::String(json),
+            Err(e) => {
+                // Serialize errors should be caught during development
+                panic!("failed to serialize JsonText field: {}", e)
+            }
+        }
+    }
+
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
+        match value {
+            Value::String(s) => match serde_json::from_str::<T>(s) {
+                Ok(inner) => Some(JsonText { inner }),
+                Err(e) => {
+                    // Log the error but return None to indicate failure
+                    // The caller can decide how to handle deserialization failure
+                    eprintln!("failed to deserialize JsonText field: {}", e);
+                    None
+                }
+            },
+            Value::None => None,
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub struct HasCrudFieldsError {
     pub value: Value,
@@ -742,7 +792,7 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
 mod test {
 
     use crate::{
-        self as tymigrawr, AutoPrimaryKey, Crud, CrudBackend, HasCrudFields, IsCrudField,
+        self as tymigrawr, AutoPrimaryKey, Crud, CrudBackend, HasCrudFields, IsCrudField, JsonText,
         MigrateEntireTable, Migrations, PrimaryKey,
     };
 
@@ -818,10 +868,8 @@ mod test {
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct Palette {
         pub id: PrimaryKey<i64>,
-        #[json_text]
-        pub colors: Vec<Color>,
-        #[json_text]
-        pub metadata: Option<Vec<String>>,
+        pub colors: JsonText<Vec<Color>>,
+        pub metadata: Option<JsonText<Vec<String>>>,
     }
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
@@ -1152,7 +1200,7 @@ mod test {
         // Insert a palette with colors and Some metadata
         let palette = Palette {
             id: PrimaryKey::new(1),
-            colors: vec![
+            colors: JsonText::new(vec![
                 Color {
                     name: "red".into(),
                     hex: 0xFF0000,
@@ -1161,8 +1209,8 @@ mod test {
                     name: "green".into(),
                     hex: 0x00FF00,
                 },
-            ],
-            metadata: Some(vec!["warm".into(), "nature".into()]),
+            ]),
+            metadata: Some(JsonText::new(vec!["warm".into(), "nature".into()])),
         };
         <Palette as Crud<B>>::insert(&palette, conn).unwrap();
 
@@ -1177,10 +1225,10 @@ mod test {
         // Insert a palette with None metadata
         let palette_no_meta = Palette {
             id: PrimaryKey::new(2),
-            colors: vec![Color {
+            colors: JsonText::new(vec![Color {
                 name: "blue".into(),
                 hex: 0x0000FF,
-            }],
+            }]),
             metadata: None,
         };
         <Palette as Crud<B>>::insert(&palette_no_meta, conn).unwrap();
@@ -1195,10 +1243,10 @@ mod test {
         // Upsert the first palette with updated colors
         let updated = Palette {
             id: PrimaryKey::new(1),
-            colors: vec![Color {
+            colors: JsonText::new(vec![Color {
                 name: "purple".into(),
                 hex: 0x800080,
-            }],
+            }]),
             metadata: None,
         };
         <Palette as Crud<B>>::upsert(&updated, conn).unwrap();
