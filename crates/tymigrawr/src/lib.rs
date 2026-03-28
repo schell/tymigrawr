@@ -303,6 +303,201 @@ impl<T: IsCrudField> IsCrudField for Option<T> {
     }
 }
 
+/// A non-auto-incrementing primary key with an explicit value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PrimaryKey<T> {
+    pub inner: T,
+}
+
+impl<T> PrimaryKey<T> {
+    pub fn new(value: T) -> Self {
+        Self { inner: value }
+    }
+}
+
+/// An auto-incrementing primary key. Use `default()` to generate, or `new(value)` for explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AutoPrimaryKey<T> {
+    pub inner: Option<T>,
+}
+
+impl<T> AutoPrimaryKey<T> {
+    pub fn new(value: T) -> Self {
+        Self { inner: Some(value) }
+    }
+}
+
+impl<T: Default> Default for AutoPrimaryKey<T> {
+    fn default() -> Self {
+        Self { inner: None }
+    }
+}
+
+// IsCrudField implementations for PrimaryKey<T>
+
+impl IsCrudField for PrimaryKey<i64> {
+    type MaybeSelf = Option<Self>;
+
+    fn field() -> CrudField {
+        CrudField {
+            ty: ValueType::Integer,
+            primary_key: true,
+            auto_increment: false,
+            ..Default::default()
+        }
+    }
+
+    fn into_value(&self) -> Value {
+        self.inner.into()
+    }
+
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
+        value.as_i64().map(|i| PrimaryKey { inner: i })
+    }
+}
+
+impl IsCrudField for PrimaryKey<i32> {
+    type MaybeSelf = Option<Self>;
+
+    fn field() -> CrudField {
+        CrudField {
+            ty: ValueType::Integer,
+            primary_key: true,
+            auto_increment: false,
+            ..Default::default()
+        }
+    }
+
+    fn into_value(&self) -> Value {
+        let i = i64::from(self.inner);
+        i.into()
+    }
+
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
+        let i = value.as_i64()?;
+        let i = i32::try_from(i).ok()?;
+        Some(PrimaryKey { inner: i })
+    }
+}
+
+impl IsCrudField for PrimaryKey<u32> {
+    type MaybeSelf = Option<Self>;
+
+    fn field() -> CrudField {
+        CrudField {
+            ty: ValueType::Integer,
+            primary_key: true,
+            auto_increment: false,
+            ..Default::default()
+        }
+    }
+
+    fn into_value(&self) -> Value {
+        let i = i64::from(self.inner);
+        i.into()
+    }
+
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
+        let i = value.as_i64()?;
+        u32::try_from(i).ok().map(|u| PrimaryKey { inner: u })
+    }
+}
+
+// IsCrudField implementations for AutoPrimaryKey<T>
+
+impl IsCrudField for AutoPrimaryKey<i64> {
+    type MaybeSelf = Option<Self>;
+
+    fn field() -> CrudField {
+        CrudField {
+            ty: ValueType::Integer,
+            primary_key: true,
+            auto_increment: true,
+            ..Default::default()
+        }
+    }
+
+    fn into_value(&self) -> Value {
+        self.inner.into()
+    }
+
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
+        value.as_i64().map(|i| AutoPrimaryKey { inner: Some(i) })
+    }
+}
+
+impl IsCrudField for AutoPrimaryKey<i32> {
+    type MaybeSelf = Option<Self>;
+
+    fn field() -> CrudField {
+        CrudField {
+            ty: ValueType::Integer,
+            primary_key: true,
+            auto_increment: true,
+            ..Default::default()
+        }
+    }
+
+    fn into_value(&self) -> Value {
+        match self.inner {
+            Some(v) => {
+                let i = i64::from(v);
+                i.into()
+            }
+            None => Value::None,
+        }
+    }
+
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
+        match value {
+            Value::Integer(i) => {
+                let i32_val = i32::try_from(*i).ok()?;
+                Some(AutoPrimaryKey {
+                    inner: Some(i32_val),
+                })
+            }
+            Value::None => Some(AutoPrimaryKey { inner: None }),
+            _ => None,
+        }
+    }
+}
+
+impl IsCrudField for AutoPrimaryKey<u32> {
+    type MaybeSelf = Option<Self>;
+
+    fn field() -> CrudField {
+        CrudField {
+            ty: ValueType::Integer,
+            primary_key: true,
+            auto_increment: true,
+            ..Default::default()
+        }
+    }
+
+    fn into_value(&self) -> Value {
+        match self.inner {
+            Some(v) => {
+                let i = i64::from(v);
+                i.into()
+            }
+            None => Value::None,
+        }
+    }
+
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
+        match value {
+            Value::Integer(i) => {
+                let u32_val = u32::try_from(*i).ok()?;
+                Some(AutoPrimaryKey {
+                    inner: Some(u32_val),
+                })
+            }
+            Value::None => Some(AutoPrimaryKey { inner: None }),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub struct HasCrudFieldsError {
     pub value: Value,
@@ -547,14 +742,13 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
 mod test {
 
     use crate::{
-        self as tymigrawr, Crud, CrudBackend, HasCrudFields, IsCrudField, MigrateEntireTable,
-        Migrations,
+        self as tymigrawr, AutoPrimaryKey, Crud, CrudBackend, HasCrudFields, IsCrudField,
+        MigrateEntireTable, Migrations, PrimaryKey,
     };
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV1 {
-        #[primary_key]
-        pub id: i64,
+        pub id: PrimaryKey<i64>,
         pub name: String,
     }
 
@@ -579,16 +773,14 @@ mod test {
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV2 {
-        #[primary_key]
-        pub id: i64,
+        pub id: PrimaryKey<i64>,
         pub name: String,
         pub age: f32,
     }
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV3 {
-        #[primary_key]
-        pub id: i64,
+        pub id: PrimaryKey<i64>,
         pub name: String,
         pub description: String,
     }
@@ -625,8 +817,7 @@ mod test {
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct Palette {
-        #[primary_key]
-        pub id: i64,
+        pub id: PrimaryKey<i64>,
         #[json_text]
         pub colors: Vec<Color>,
         #[json_text]
@@ -635,8 +826,7 @@ mod test {
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct SettingsV1 {
-        #[primary_key]
-        pub id: i64,
+        pub id: PrimaryKey<i64>,
         pub api_key: Option<String>,
         pub token: Option<String>,
         pub timeout_secs: i64,
@@ -644,15 +834,19 @@ mod test {
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct AutoIncrementModel {
-        #[primary_key(auto_increment)]
-        pub id: i64,
+        pub id: AutoPrimaryKey<i64>,
         pub name: String,
     }
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct AutoIncrementModelI32 {
-        #[primary_key(auto_increment)]
-        pub id: i32,
+        pub id: AutoPrimaryKey<i32>,
+        pub name: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, HasCrudFields)]
+    pub struct AutoIncrementModelU32 {
+        pub id: AutoPrimaryKey<u32>,
         pub name: String,
     }
 
@@ -662,7 +856,7 @@ mod test {
     {
         <PlayerV1 as Crud<B>>::create(conn).unwrap();
         let first_player = PlayerV1 {
-            id: 0,
+            id: PrimaryKey::new(0),
             name: "tymigrawr".to_string(),
         };
         <PlayerV1 as Crud<B>>::insert(&first_player, conn).unwrap();
@@ -673,7 +867,7 @@ mod test {
             .unwrap();
         assert_eq!(first_player, player);
         let mut second_player = PlayerV1 {
-            id: 1,
+            id: PrimaryKey::new(1),
             name: "developer".to_string(),
         };
         <PlayerV1 as Crud<B>>::insert(&second_player, conn).unwrap();
@@ -684,14 +878,14 @@ mod test {
             .unwrap();
         assert_eq!(second_player, player);
 
-        let mut p1 = <PlayerV1 as Crud<B>>::read(conn, first_player.id).unwrap();
+        let mut p1 = <PlayerV1 as Crud<B>>::read(conn, first_player.id.inner).unwrap();
         assert_eq!(first_player, p1.next().unwrap().unwrap());
-        let mut p2 = <PlayerV1 as Crud<B>>::read(conn, second_player.id).unwrap();
+        let mut p2 = <PlayerV1 as Crud<B>>::read(conn, second_player.id.inner).unwrap();
         assert_eq!(second_player, p2.next().unwrap().unwrap());
 
         second_player.name = "software engineer".to_string();
         <PlayerV1 as Crud<B>>::update(&second_player, conn).unwrap();
-        let p2 = <PlayerV1 as Crud<B>>::read(conn, second_player.id)
+        let p2 = <PlayerV1 as Crud<B>>::read(conn, second_player.id.inner)
             .unwrap()
             .next()
             .unwrap()
@@ -699,7 +893,7 @@ mod test {
         assert_eq!(second_player, p2);
 
         <PlayerV1 as Crud<B>>::delete(second_player, conn).unwrap();
-        let players = <PlayerV1 as Crud<B>>::read(conn, p2.id)
+        let players = <PlayerV1 as Crud<B>>::read(conn, p2.id.inner)
             .unwrap()
             .map(|p| p.unwrap())
             .collect::<Vec<_>>();
@@ -714,7 +908,7 @@ mod test {
 
         // Upsert a new row — should insert and return true
         let player = PlayerV1 {
-            id: 42,
+            id: PrimaryKey::new(42),
             name: "original".to_string(),
         };
         let changed = <PlayerV1 as Crud<B>>::upsert(&player, conn).unwrap();
@@ -730,7 +924,7 @@ mod test {
 
         // Upsert with same PK but different data — should update and return true
         let updated = PlayerV1 {
-            id: 42,
+            id: PrimaryKey::new(42),
             name: "updated".to_string(),
         };
         let changed = <PlayerV1 as Crud<B>>::upsert(&updated, conn).unwrap();
@@ -751,7 +945,7 @@ mod test {
         assert_eq!(1, all.len(), "upsert should not duplicate rows");
     }
 
-    fn test_auto_increment<B: CrudBackend>(conn: B::Connection<'_>)
+    fn test_auto_increment_i64<B: CrudBackend>(conn: B::Connection<'_>)
     where
         AutoIncrementModel: Crud<B>,
     {
@@ -765,27 +959,56 @@ mod test {
             .expect("id field should exist");
         assert!(
             id_field.primary_key,
-            "id field should be marked as primary key"
+            "i64 id field should be marked as primary key"
         );
         assert!(
             id_field.auto_increment,
-            "id field should be marked as auto_increment"
+            "i64 id field should be marked as auto_increment"
         );
 
-        // Insert a record with auto_increment
-        let record = AutoIncrementModel {
-            id: 0,
-            name: "test".to_string(),
+        // Insert three records with auto_increment and verify sequential IDs
+        let record1 = AutoIncrementModel {
+            id: AutoPrimaryKey::default(),
+            name: "first".to_string(),
         };
-        <AutoIncrementModel as Crud<B>>::insert(&record, conn).unwrap();
+        <AutoIncrementModel as Crud<B>>::insert(&record1, conn).unwrap();
 
-        // Read it back to verify it was created
-        let from_db = <AutoIncrementModel as Crud<B>>::read(conn, 0)
+        let record2 = AutoIncrementModel {
+            id: AutoPrimaryKey::default(),
+            name: "second".to_string(),
+        };
+        <AutoIncrementModel as Crud<B>>::insert(&record2, conn).unwrap();
+
+        let record3 = AutoIncrementModel {
+            id: AutoPrimaryKey::default(),
+            name: "third".to_string(),
+        };
+        <AutoIncrementModel as Crud<B>>::insert(&record3, conn).unwrap();
+
+        // Verify all records were created with sequential IDs
+        let from_db_1 = <AutoIncrementModel as Crud<B>>::read(conn, 1)
             .unwrap()
             .next()
             .unwrap()
             .unwrap();
-        assert_eq!(from_db.name, "test");
+        assert_eq!(from_db_1.name, "first");
+        assert_eq!(from_db_1.id.inner, Some(1));
+
+        let from_db_2 = <AutoIncrementModel as Crud<B>>::read(conn, 2)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db_2.name, "second");
+        assert_eq!(from_db_2.id.inner, Some(2));
+
+        let from_db_3 = <AutoIncrementModel as Crud<B>>::read(conn, 3)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db_3.name, "third");
+        assert_eq!(from_db_3.id.inner, Some(3));
     }
 
     fn test_auto_increment_i32<B: CrudBackend>(conn: B::Connection<'_>)
@@ -802,27 +1025,122 @@ mod test {
             .expect("id field should exist");
         assert!(
             id_field.primary_key,
-            "id field should be marked as primary key"
+            "i32 id field should be marked as primary key"
         );
         assert!(
             id_field.auto_increment,
-            "id field should be marked as auto_increment for i32 type"
+            "i32 id field should be marked as auto_increment"
         );
 
-        // Insert a record with auto_increment
-        let record = AutoIncrementModelI32 {
-            id: 0,
-            name: "test i32".to_string(),
+        // Insert three records with auto_increment and verify sequential IDs
+        let record1 = AutoIncrementModelI32 {
+            id: AutoPrimaryKey::default(),
+            name: "first i32".to_string(),
         };
-        <AutoIncrementModelI32 as Crud<B>>::insert(&record, conn).unwrap();
+        <AutoIncrementModelI32 as Crud<B>>::insert(&record1, conn).unwrap();
 
-        // Read it back to verify it was created
-        let from_db = <AutoIncrementModelI32 as Crud<B>>::read(conn, 0)
+        let record2 = AutoIncrementModelI32 {
+            id: AutoPrimaryKey::default(),
+            name: "second i32".to_string(),
+        };
+        <AutoIncrementModelI32 as Crud<B>>::insert(&record2, conn).unwrap();
+
+        let record3 = AutoIncrementModelI32 {
+            id: AutoPrimaryKey::default(),
+            name: "third i32".to_string(),
+        };
+        <AutoIncrementModelI32 as Crud<B>>::insert(&record3, conn).unwrap();
+
+        // Verify all records were created with sequential IDs
+        let from_db_1 = <AutoIncrementModelI32 as Crud<B>>::read(conn, 1)
             .unwrap()
             .next()
             .unwrap()
             .unwrap();
-        assert_eq!(from_db.name, "test i32");
+        assert_eq!(from_db_1.name, "first i32");
+        assert_eq!(from_db_1.id.inner, Some(1));
+
+        let from_db_2 = <AutoIncrementModelI32 as Crud<B>>::read(conn, 2)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db_2.name, "second i32");
+        assert_eq!(from_db_2.id.inner, Some(2));
+
+        let from_db_3 = <AutoIncrementModelI32 as Crud<B>>::read(conn, 3)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db_3.name, "third i32");
+        assert_eq!(from_db_3.id.inner, Some(3));
+    }
+
+    fn test_auto_increment_u32<B: CrudBackend>(conn: B::Connection<'_>)
+    where
+        AutoIncrementModelU32: Crud<B>,
+    {
+        <AutoIncrementModelU32 as Crud<B>>::create(conn).unwrap();
+
+        // Verify that the id field has auto_increment enabled (u32 variant)
+        let crud_fields = <AutoIncrementModelU32 as HasCrudFields>::crud_fields();
+        let id_field = crud_fields
+            .iter()
+            .find(|f| f.name == "id")
+            .expect("id field should exist");
+        assert!(
+            id_field.primary_key,
+            "u32 id field should be marked as primary key"
+        );
+        assert!(
+            id_field.auto_increment,
+            "u32 id field should be marked as auto_increment"
+        );
+
+        // Insert three records with auto_increment and verify sequential IDs
+        let record1 = AutoIncrementModelU32 {
+            id: AutoPrimaryKey::default(),
+            name: "first u32".to_string(),
+        };
+        <AutoIncrementModelU32 as Crud<B>>::insert(&record1, conn).unwrap();
+
+        let record2 = AutoIncrementModelU32 {
+            id: AutoPrimaryKey::default(),
+            name: "second u32".to_string(),
+        };
+        <AutoIncrementModelU32 as Crud<B>>::insert(&record2, conn).unwrap();
+
+        let record3 = AutoIncrementModelU32 {
+            id: AutoPrimaryKey::default(),
+            name: "third u32".to_string(),
+        };
+        <AutoIncrementModelU32 as Crud<B>>::insert(&record3, conn).unwrap();
+
+        // Verify all records were created with sequential IDs
+        let from_db_1 = <AutoIncrementModelU32 as Crud<B>>::read(conn, 1)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db_1.name, "first u32");
+        assert_eq!(from_db_1.id.inner, Some(1));
+
+        let from_db_2 = <AutoIncrementModelU32 as Crud<B>>::read(conn, 2)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db_2.name, "second u32");
+        assert_eq!(from_db_2.id.inner, Some(2));
+
+        let from_db_3 = <AutoIncrementModelU32 as Crud<B>>::read(conn, 3)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db_3.name, "third u32");
+        assert_eq!(from_db_3.id.inner, Some(3));
     }
 
     fn test_json_text<B: CrudBackend>(conn: B::Connection<'_>)
@@ -833,7 +1151,7 @@ mod test {
 
         // Insert a palette with colors and Some metadata
         let palette = Palette {
-            id: 1,
+            id: PrimaryKey::new(1),
             colors: vec![
                 Color {
                     name: "red".into(),
@@ -858,7 +1176,7 @@ mod test {
 
         // Insert a palette with None metadata
         let palette_no_meta = Palette {
-            id: 2,
+            id: PrimaryKey::new(2),
             colors: vec![Color {
                 name: "blue".into(),
                 hex: 0x0000FF,
@@ -876,7 +1194,7 @@ mod test {
 
         // Upsert the first palette with updated colors
         let updated = Palette {
-            id: 1,
+            id: PrimaryKey::new(1),
             colors: vec![Color {
                 name: "purple".into(),
                 hex: 0x800080,
@@ -906,17 +1224,17 @@ mod test {
     {
         <PlayerV2 as Crud<B>>::create(conn).unwrap();
         let mut first_player = PlayerV2 {
-            id: 0,
+            id: PrimaryKey::new(0),
             name: "tymigrawr".to_string(),
             age: 0.1,
         };
         <PlayerV2 as Crud<B>>::insert(&first_player, conn).unwrap();
-        let mut p1 = <PlayerV2 as Crud<B>>::read(conn, first_player.id).unwrap();
+        let mut p1 = <PlayerV2 as Crud<B>>::read(conn, first_player.id.inner).unwrap();
         assert_eq!(first_player, p1.next().unwrap().unwrap());
 
         first_player.name = "software engineer".to_string();
         <PlayerV2 as Crud<B>>::update(&first_player, conn).unwrap();
-        let p2 = <PlayerV2 as Crud<B>>::read(conn, first_player.id)
+        let p2 = <PlayerV2 as Crud<B>>::read(conn, first_player.id.inner)
             .unwrap()
             .next()
             .unwrap()
@@ -924,7 +1242,7 @@ mod test {
         assert_eq!(first_player, p2);
 
         <PlayerV2 as Crud<B>>::delete(first_player, conn).unwrap();
-        let players = <PlayerV2 as Crud<B>>::read(conn, p2.id)
+        let players = <PlayerV2 as Crud<B>>::read(conn, p2.id.inner)
             .unwrap()
             .map(|p| p.unwrap())
             .collect::<Vec<_>>();
@@ -951,7 +1269,7 @@ mod test {
         log::debug!("populating v1");
         let players_v1 = (0..100)
             .map(|i| PlayerV1 {
-                id: i,
+                id: PrimaryKey::new(i),
                 name: format!("tymigrawr_{i}"),
             })
             .collect::<Vec<_>>();
@@ -1032,7 +1350,7 @@ mod test {
 
             // Insert a row with NULL Option fields
             let settings = SettingsV1 {
-                id: 1,
+                id: PrimaryKey::new(1),
                 api_key: None,
                 token: None,
                 timeout_secs: 60,
@@ -1049,7 +1367,7 @@ mod test {
 
             // Insert another row with Some values
             let settings2 = SettingsV1 {
-                id: 2,
+                id: PrimaryKey::new(2),
                 api_key: Some("secret-key".to_string()),
                 token: Some("auth-token".to_string()),
                 timeout_secs: 120,
@@ -1065,7 +1383,7 @@ mod test {
 
             // Insert row with mixed Some/None
             let settings3 = SettingsV1 {
-                id: 3,
+                id: PrimaryKey::new(3),
                 api_key: Some("key-only".to_string()),
                 token: None,
                 timeout_secs: 90,
@@ -1081,15 +1399,21 @@ mod test {
         }
 
         #[test]
-        fn auto_increment() {
+        fn auto_increment_i64() {
             let conn = sqlite::open(":memory:").unwrap();
-            test_auto_increment::<Sqlite>(&conn);
+            test_auto_increment_i64::<Sqlite>(&conn);
         }
 
         #[test]
         fn auto_increment_i32() {
             let conn = sqlite::open(":memory:").unwrap();
             test_auto_increment_i32::<Sqlite>(&conn);
+        }
+
+        #[test]
+        fn auto_increment_u32() {
+            let conn = sqlite::open(":memory:").unwrap();
+            test_auto_increment_u32::<Sqlite>(&conn);
         }
 
         #[test]

@@ -154,7 +154,18 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
         connection: &sqlite::Connection,
     ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
-        let fields = self.as_crud_fields();
+        let crud_fields = Self::crud_fields();
+        let mut fields = self.as_crud_fields();
+
+        // For auto_increment fields with value 0, omit them from the INSERT so SQLite generates the value
+        for field in &crud_fields {
+            if field.auto_increment {
+                if let Some(Value::Integer(0)) = fields.get(field.name) {
+                    fields.remove(field.name);
+                }
+            }
+        }
+
         Sqlite::insert_fields(connection, table_name, &fields)?;
         Ok(())
     }

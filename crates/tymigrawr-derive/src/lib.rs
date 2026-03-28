@@ -25,30 +25,12 @@ fn has_json_text_attr(atts: &[Attribute]) -> bool {
     })
 }
 
-/// Checks if an attribute is `#[primary_key(...)]` and returns whether it has `auto_increment`.
-fn parse_primary_key_attr(att: &Attribute) -> Option<bool> {
-    if let Some(ident) = att.path.get_ident() {
-        if ident == "primary_key" {
-            // Parse the attribute to check for (auto_increment) parameter
-            if att.tokens.is_empty() {
-                // #[primary_key] with no parameters
-                return Some(false);
-            }
-            // Try to parse (auto_increment) or similar
-            let tokens_str = att.tokens.to_string();
-            // Check if tokens contain "auto_increment"
-            return Some(tokens_str.contains("auto_increment"));
-        }
-    }
-    None
-}
-
-/// Returns `true` if the field type is an integer type (i64 or i32).
-fn is_integer_type(ty: &Type) -> bool {
+/// Returns `true` if the type looks like `PrimaryKey<...>` or `AutoPrimaryKey<...>`.
+fn is_primary_key_type(ty: &Type) -> bool {
     if let Type::Path(ref tp) = ty {
         if let Some(seg) = tp.path.segments.last() {
             let ident_str = format!("{}", seg.ident);
-            return ident_str == "i64" || ident_str == "i32";
+            return ident_str == "PrimaryKey" || ident_str == "AutoPrimaryKey";
         }
     }
     false
@@ -80,33 +62,6 @@ fn gen_crud_fields(
         .zip(tys.iter().zip(atts))
         .map(|(ident, (ty, atts))| {
             let is_json = has_json_text_attr(atts);
-            let mut has_primary_key = false;
-            let mut has_auto_increment = false;
-
-            for att in atts {
-                if let Some(auto_inc) = parse_primary_key_attr(att) {
-                    has_primary_key = true;
-                    has_auto_increment = auto_inc;
-                    // Validate: auto_increment only on integer types
-                    if has_auto_increment && !is_integer_type(ty) {
-                        return quote! {
-                            compile_error!("auto_increment is only supported on integer types (i64, i32)");
-                        };
-                    }
-                }
-            }
-
-            let mut extras = vec![];
-            if has_primary_key {
-                extras.push(quote! {
-                    #ident.primary_key = true;
-                });
-            }
-            if has_auto_increment {
-                extras.push(quote! {
-                    #ident.auto_increment = true;
-                });
-            }
 
             if is_json {
                 // json_text fields are stored as TEXT — the field type does not
@@ -119,14 +74,12 @@ fn gen_crud_fields(
                         ..Default::default()
                     };
                     #ident.name = stringify!(#ident);
-                    #(#extras)*
                     #ident
                 }
             } else {
                 quote! {
                     let mut #ident = <#ty>::field();
                     #ident.name = stringify!(#ident);
-                    #(#extras)*
                     #ident
                 }
             }
@@ -136,34 +89,43 @@ fn gen_crud_fields(
 
 fn get_primary_key(
     idents: &[Ident],
-    atts: &[Vec<Attribute>],
+    tys: &[Type],
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
-    let mut keys = idents.iter().zip(atts).filter_map(|(ident, atts)| {
-        for att in atts.iter() {
-            if parse_primary_key_attr(att).is_some() {
-                return Some(ident.clone());
-            }
+    // Find the field with PrimaryKey<T> or AutoPrimaryKey<T> type
+    let mut primary_keys = idents.iter().zip(tys.iter()).filter_map(|(ident, ty)| {
+        if is_primary_key_type(ty) {
+            Some(ident.clone())
+        } else {
+            None
         }
-        None
     });
-    let may_ident = if let Some(ident) = keys.next() {
-        Some(ident)
-    } else {
-        idents.first().cloned()
-    };
 
-    if let Some(ident) = may_ident {
-        (
-            quote! {stringify!(#ident)},
-            quote! {self.#ident.into_value()},
-        )
-    } else {
-        (
-            quote! {
-                compile_error!("must have at least one field")
-            },
-            quote! {},
-        )
+    match (primary_keys.next(), primary_keys.next()) {
+        (Some(ident), None) => {
+            // Exactly one primary key field found
+            (
+                quote! {stringify!(#ident)},
+                quote! {self.#ident.into_value()},
+            )
+        }
+        (Some(_), Some(_)) => {
+            // Multiple primary key fields
+            (
+                quote! {
+                    compile_error!("struct must have exactly one primary key field (PrimaryKey<T> or AutoPrimaryKey<T>)")
+                },
+                quote! {},
+            )
+        }
+        (None, _) => {
+            // No primary key field found
+            (
+                quote! {
+                    compile_error!("struct must have exactly one primary key field (PrimaryKey<T> or AutoPrimaryKey<T>)")
+                },
+                quote! {},
+            )
+        }
     }
 }
 
@@ -304,7 +266,7 @@ fn gen_as_crud_field_pairs(
 }
 
 /// Macro for deriving structs that have normal CRUD-worthy fields.
-#[proc_macro_derive(HasCrudFields, attributes(primary_key, json_text))]
+#[proc_macro_derive(HasCrudFields, attributes(json_text))]
 pub fn derive_crud_fields(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = syn::parse_macro_input!(input);
     let name = input.ident;
@@ -339,7 +301,7 @@ pub fn derive_crud_fields(input: proc_macro::TokenStream) -> proc_macro::TokenSt
     let crud_fields = gen_crud_fields(&field_idents, &field_tys, &field_atts);
     let from_crud_fields = gen_from_crud_fields(&field_idents, &field_tys, &field_atts);
     let as_crud_field_pairs = gen_as_crud_field_pairs(&field_idents, &field_tys, &field_atts);
-    let (primary_key, primary_key_val) = get_primary_key(&field_idents, &field_atts);
+    let (primary_key, primary_key_val) = get_primary_key(&field_idents, &field_tys);
     let output = quote! {
         #[automatically_derived]
         impl #impl_generics tymigrawr::HasCrudFields for #name #ty_generics #where_clause {
