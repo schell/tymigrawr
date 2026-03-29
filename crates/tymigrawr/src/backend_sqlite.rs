@@ -2,128 +2,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    error::TymResult, Crud, CrudBackend, CrudField, Error, HasCrudFields, HasCrudFieldsError,
-    IsCrudField, MigrateEntireTable, Migration, Value, ValueType,
+    error::{DomainError, TymResult},
+    Crud, CrudBackend, CrudField, Error, HasCrudFields, HasCrudFieldsError, IsCrudField,
+    MigrateEntireTable, Migration, Value, ValueType,
 };
-
-impl CrudField {
-    pub fn sqlite_create_field(&self) -> String {
-        let Self {
-            name,
-            ty,
-            nullable,
-            primary_key,
-            auto_increment,
-        } = self;
-        let ty = match ty {
-            ValueType::Integer => "INTEGER",
-            ValueType::Float => "FLOAT",
-            ValueType::String => "TEXT",
-            ValueType::Bytes => "BLOB",
-        };
-        let nullable = if *nullable { "" } else { "NOT NULL" };
-        let prim_key = if *primary_key { "PRIMARY KEY" } else { "" };
-        let inc = if *auto_increment { "AUTOINCREMENT" } else { "" };
-        format!("{name} {ty} {prim_key} {inc} {nullable}")
-    }
-}
-
-impl From<Value> for sqlite::Value {
-    fn from(value: Value) -> Self {
-        match value {
-            Value::Integer(i) => sqlite::Value::Integer(i),
-            Value::Float(i) => sqlite::Value::Float(i),
-            Value::String(i) => sqlite::Value::String(i),
-            Value::Bytes(i) => sqlite::Value::Binary(i),
-            Value::None => sqlite::Value::Null,
-        }
-    }
-}
-
-impl From<sqlite::Value> for Value {
-    fn from(value: sqlite::Value) -> Self {
-        match value {
-            sqlite::Value::Integer(i) => Value::Integer(i),
-            sqlite::Value::Float(i) => Value::Float(i),
-            sqlite::Value::String(i) => Value::String(i),
-            sqlite::Value::Binary(i) => Value::Bytes(i),
-            sqlite::Value::Null => Value::None,
-        }
-    }
-}
-
-impl MigrateEntireTable for Sqlite {
-    fn read_all_values<'a>(
-        connection: <Self as CrudBackend>::Connection<'a>,
-        table_name: &'a str,
-        fields: Vec<CrudField>,
-    ) -> TymResult<Vec<crate::ReadAllValuesResult<'a, Self::Error>>, Self::Error> {
-        let column_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
-        let statement = format!("SELECT * FROM {table_name};");
-        let query = connection
-            .prepare(statement)
-            .map_err(|e| Error::Sqlite { source: e })?;
-        let cursor = query
-            .into_iter()
-            .map(
-                move |row| -> Result<HashMap<&str, Value>, Error<<Sqlite as CrudBackend>::Error>> {
-                    let row = row?;
-                    let mut cols = HashMap::default();
-                    for name in column_names.iter() {
-                        let value = &row[*name];
-                        cols.insert(*name, value.clone().into());
-                    }
-                    Ok(cols)
-                },
-            )
-            .collect::<Vec<_>>();
-        Ok(cursor)
-    }
-
-    fn insert_fields(
-        connection: &sqlite::Connection,
-        table_name: &str,
-        fields: &HashMap<&str, Value>,
-    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
-        let columns = fields.iter().map(|f| *f.0).collect::<Vec<_>>().join(", ");
-        let binds = fields
-            .iter()
-            .map(|f| format!(":{}", *f.0))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let statement = format!("INSERT INTO {table_name} ({columns}) VALUES ({binds});");
-        let mut query = connection
-            .prepare(&statement)
-            .map_err(|e| Error::Sqlite { source: e })?;
-        for (key, value) in fields.iter() {
-            let key = format!(":{key}");
-            let k = key.as_str();
-            let value = sqlite::Value::from(value.clone());
-            query.bind((k, value))?;
-        }
-
-        let state = query.next()?;
-        if !matches!(state, sqlite::State::Done) {
-            return Err(Error::OperationFailed {
-                operation: "insert".to_string(),
-                reason: "query not ok".to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    fn delete_all(
-        connection: &sqlite::Connection,
-        table_name: &str,
-    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
-        let statement = format!("DELETE FROM {table_name};");
-        let mut query = connection
-            .prepare(&statement)
-            .map_err(|e| Error::Sqlite { source: e })?;
-        while query.next().is_ok() {}
-        Ok(())
-    }
-}
 
 pub struct Sqlite;
 
@@ -146,7 +28,8 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
         let statement = format!("CREATE TABLE IF NOT EXISTS {table_name} ({fields});");
         connection
             .execute(statement)
-            .map_err(|e| Error::Sqlite { source: e })
+            .map_err(|inner| DomainError { inner })?;
+        Ok(())
     }
 
     fn insert(
@@ -221,14 +104,14 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
 
         let mut query = connection
             .prepare(&statement)
-            .map_err(|e| Error::Sqlite { source: e })?;
+            .map_err(|e| DomainError { inner: e })?;
 
         for (key, value) in field_values.into_iter() {
             let bind_key = format!(":{key}");
             let v = sqlite::Value::from(value);
             query
                 .bind((bind_key.as_str(), v))
-                .map_err(|e| Error::Sqlite { source: e })?;
+                .map_err(|e| DomainError { inner: e })?;
         }
 
         if !matches!(query.next(), Ok(sqlite::State::Done)) {
@@ -272,16 +155,16 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             format!("SELECT * FROM {table_name} WHERE {key_name} {comparison} :key_value");
         let mut query = connection
             .prepare(statement)
-            .map_err(|e| Error::Sqlite { source: e })?;
+            .map_err(|e| DomainError { inner: e })?;
         let value = key_value.into_value();
         let value = sqlite::Value::from(value);
         query
             .bind((":key_value", value))
-            .map_err(|e| Error::Sqlite { source: e })?;
+            .map_err(DomainError::from)?;
         let cursor = query
             .into_iter()
             .map(move |row| -> TymResult<Self, sqlite::Error> {
-                let row = row.map_err(|e| Error::Sqlite { source: e })?;
+                let row = row.map_err(DomainError::from)?;
                 let mut cols = HashMap::default();
                 for name in column_names.iter() {
                     let value = &row[*name];
@@ -334,7 +217,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             format!("UPDATE {table_name} SET {values} WHERE {primary_key} = :key_value",);
         let mut query = connection
             .prepare(statement)
-            .map_err(|e| Error::Sqlite { source: e })?;
+            .map_err(|inner| DomainError { inner })?;
         let mut key_value = None;
         for (key, value) in fields.into_iter() {
             if key == primary_key {
@@ -344,9 +227,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             let key = format!(":{key}");
             let k = key.as_str();
             let v = sqlite::Value::from(value);
-            query
-                .bind((k, v))
-                .map_err(|e| Error::Sqlite { source: e })?;
+            query.bind((k, v)).map_err(|e| DomainError { inner: e })?;
         }
         let key_value = key_value.ok_or_else(|| Error::OperationFailed {
             operation: "delete".into(),
@@ -355,7 +236,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
         let key_value = sqlite::Value::from(key_value);
         query
             .bind((":key_value", key_value))
-            .map_err(|e| Error::Sqlite { source: e })?;
+            .map_err(|e| DomainError { inner: e })?;
 
         if let Ok(sqlite::State::Done) = query.next() {
             Ok(())
@@ -400,10 +281,10 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             format!("DELETE FROM {table_name} WHERE {key_name} = :key_value RETURNING *");
         let mut query = connection
             .prepare(statement)
-            .map_err(|e| Error::Sqlite { source: e })?;
+            .map_err(|e| DomainError { inner: e })?;
         query
             .bind((":key_value", key_value))
-            .map_err(|e| Error::Sqlite { source: e })?;
+            .map_err(|e| DomainError { inner: e })?;
         while let Ok(sqlite::State::Row) = query.next() {}
 
         Ok(())
@@ -434,6 +315,125 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
                 Ok(Box::new(s))
             }),
         }
+    }
+}
+
+impl CrudField {
+    pub fn sqlite_create_field(&self) -> String {
+        let Self {
+            name,
+            ty,
+            nullable,
+            primary_key,
+            auto_increment,
+        } = self;
+        let ty = match ty {
+            ValueType::Integer => "INTEGER",
+            ValueType::Float => "FLOAT",
+            ValueType::String => "TEXT",
+            ValueType::Bytes => "BLOB",
+        };
+        let nullable = if *nullable { "" } else { "NOT NULL" };
+        let prim_key = if *primary_key { "PRIMARY KEY" } else { "" };
+        let inc = if *auto_increment { "AUTOINCREMENT" } else { "" };
+        format!("{name} {ty} {prim_key} {inc} {nullable}")
+    }
+}
+
+impl From<Value> for sqlite::Value {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Integer(i) => sqlite::Value::Integer(i),
+            Value::Float(i) => sqlite::Value::Float(i),
+            Value::String(i) => sqlite::Value::String(i),
+            Value::Bytes(i) => sqlite::Value::Binary(i),
+            Value::None => sqlite::Value::Null,
+        }
+    }
+}
+
+impl From<sqlite::Value> for Value {
+    fn from(value: sqlite::Value) -> Self {
+        match value {
+            sqlite::Value::Integer(i) => Value::Integer(i),
+            sqlite::Value::Float(i) => Value::Float(i),
+            sqlite::Value::String(i) => Value::String(i),
+            sqlite::Value::Binary(i) => Value::Bytes(i),
+            sqlite::Value::Null => Value::None,
+        }
+    }
+}
+
+impl MigrateEntireTable for Sqlite {
+    fn read_all_values<'a>(
+        connection: <Self as CrudBackend>::Connection<'a>,
+        table_name: &'a str,
+        fields: Vec<CrudField>,
+    ) -> TymResult<Vec<crate::ReadAllValuesResult<'a, Self::Error>>, Self::Error> {
+        let column_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
+        let statement = format!("SELECT * FROM {table_name};");
+        let query = connection
+            .prepare(statement)
+            .map_err(|e| DomainError { inner: e })?;
+        let cursor = query
+            .into_iter()
+            .map(
+                move |row| -> Result<HashMap<&str, Value>, Error<<Sqlite as CrudBackend>::Error>> {
+                    let row = row.map_err(|inner| DomainError { inner })?;
+                    let mut cols = HashMap::default();
+                    for name in column_names.iter() {
+                        let value = &row[*name];
+                        cols.insert(*name, value.clone().into());
+                    }
+                    Ok(cols)
+                },
+            )
+            .collect::<Vec<_>>();
+        Ok(cursor)
+    }
+
+    fn insert_fields(
+        connection: &sqlite::Connection,
+        table_name: &str,
+        fields: &HashMap<&str, Value>,
+    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
+        let columns = fields.iter().map(|f| *f.0).collect::<Vec<_>>().join(", ");
+        let binds = fields
+            .iter()
+            .map(|f| format!(":{}", *f.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statement = format!("INSERT INTO {table_name} ({columns}) VALUES ({binds});");
+        let mut query = connection
+            .prepare(&statement)
+            .map_err(|e| DomainError { inner: e })?;
+        for (key, value) in fields.iter() {
+            let key = format!(":{key}");
+            let k = key.as_str();
+            let value = sqlite::Value::from(value.clone());
+            query.bind((k, value)).map_err(DomainError::from)?;
+        }
+
+        let state = query.next().map_err(DomainError::from)?;
+        if !matches!(state, sqlite::State::Done) {
+            return Err(Error::OperationFailed {
+                operation: "insert".to_string(),
+                reason: "query not ok".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn delete_all(
+        connection: &sqlite::Connection,
+        table_name: &str,
+    ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
+        let statement = format!("DELETE FROM {table_name};");
+        let mut query = connection
+            .prepare(&statement)
+            .map_err(|e| DomainError { inner: e })?;
+        while query.next().is_ok() {}
+        Ok(())
     }
 }
 

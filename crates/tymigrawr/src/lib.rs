@@ -7,7 +7,7 @@ use std::{
 use snafu::prelude::*;
 
 pub mod error;
-pub use error::{Error, LibraryError};
+pub use error::Error;
 pub use tymigrawr_derive::HasCrudFields;
 
 #[cfg(feature = "backend_sqlite")]
