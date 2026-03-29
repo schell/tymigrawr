@@ -309,6 +309,17 @@ pub struct PrimaryKey<T> {
     pub inner: T,
 }
 
+#[cfg(feature = "schemars")]
+impl<T: schemars::JsonSchema> schemars::JsonSchema for PrimaryKey<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        T::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        T::json_schema(generator)
+    }
+}
+
 impl<T> PrimaryKey<T> {
     pub fn new(value: T) -> Self {
         Self { inner: value }
@@ -330,6 +341,17 @@ impl<T> AutoPrimaryKey<T> {
 impl<T: Default> Default for AutoPrimaryKey<T> {
     fn default() -> Self {
         Self { inner: None }
+    }
+}
+
+#[cfg(feature = "schemars")]
+impl<T: schemars::JsonSchema> schemars::JsonSchema for AutoPrimaryKey<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        Option::<T>::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        Option::<T>::json_schema(generator)
     }
 }
 
@@ -505,9 +527,14 @@ pub struct JsonText<T> {
     pub inner: T,
 }
 
-impl<T> JsonText<T> {
-    pub fn new(value: T) -> Self {
-        Self { inner: value }
+#[cfg(feature = "schemars")]
+impl<T: schemars::JsonSchema> schemars::JsonSchema for JsonText<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        T::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        T::json_schema(generator)
     }
 }
 
@@ -548,6 +575,12 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> IsCrudField for JsonText
     }
 }
 
+impl<T> JsonText<T> {
+    pub fn new(value: T) -> Self {
+        Self { inner: value }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub struct HasCrudFieldsError {
     pub value: Value,
@@ -585,6 +618,21 @@ pub trait CrudBackend {
     type Error: core::fmt::Display + core::fmt::Debug + 'static;
 }
 
+type ReadAllResult<'a, T, Backend> = Result<
+    Box<dyn Iterator<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>,
+    Error<<Backend as CrudBackend>::Error>,
+>;
+
+type ReadWhereResult<'a, T, Backend> = Result<
+    Box<dyn Iterator<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>,
+    Error<<Backend as CrudBackend>::Error>,
+>;
+
+type ReadResult<'a, T, Backend> = Result<
+    Box<dyn Iterator<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>,
+    Error<<Backend as CrudBackend>::Error>,
+>;
+
 pub trait Crud<Backend>
 where
     Self: HasCrudFields + Clone + Sized + 'static,
@@ -606,30 +654,19 @@ where
         connection: Backend::Connection<'_>,
     ) -> std::result::Result<bool, Error<Backend::Error>>;
 
-    fn read_all<'a>(
-        connection: Backend::Connection<'a>,
-    ) -> std::result::Result<
-        Box<dyn Iterator<Item = TymResult<Self, Backend::Error>> + 'a>,
-        Error<Backend::Error>,
-    >;
+    fn read_all<'a>(connection: Backend::Connection<'a>) -> ReadAllResult<'a, Self, Backend>;
 
     fn read_where<'a>(
         connection: Backend::Connection<'a>,
         key_name: &'a str,
         comparison: &'a str,
         key_value: impl IsCrudField,
-    ) -> std::result::Result<
-        Box<dyn Iterator<Item = TymResult<Self, Backend::Error>> + 'a>,
-        Error<Backend::Error>,
-    >;
+    ) -> ReadWhereResult<'a, Self, Backend>;
 
     fn read<'a, Key: IsCrudField>(
         connection: Backend::Connection<'a>,
         key: Key,
-    ) -> std::result::Result<
-        Box<dyn Iterator<Item = TymResult<Self, Backend::Error>> + 'a>,
-        Error<Backend::Error>,
-    >;
+    ) -> ReadResult<'a, Self, Backend>;
 
     fn update(&self, connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
 
@@ -663,14 +700,14 @@ where
     }
 }
 
-type ReadResult<'a, E> = TymResult<HashMap<&'a str, Value>, E>;
+type ReadAllValuesResult<'a, E> = TymResult<HashMap<&'a str, Value>, E>;
 
 pub trait MigrateEntireTable: CrudBackend {
     fn read_all_values<'a>(
         connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
         fields: Vec<CrudField>,
-    ) -> TymResult<Vec<ReadResult<'a, Self::Error>>, Self::Error>;
+    ) -> TymResult<Vec<ReadAllValuesResult<'a, Self::Error>>, Self::Error>;
 
     fn insert_fields(
         connection: <Self as CrudBackend>::Connection<'_>,

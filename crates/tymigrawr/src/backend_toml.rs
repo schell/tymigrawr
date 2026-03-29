@@ -208,7 +208,7 @@ impl MigrateEntireTable for Toml {
         connection: &'a Path,
         table_name: &'a str,
         fields: Vec<CrudField>,
-    ) -> TymResult<Vec<crate::ReadResult<'a, Self::Error>>, Self::Error> {
+    ) -> TymResult<Vec<crate::ReadAllValuesResult<'a, Self::Error>>, Self::Error> {
         let path = table_path(connection, table_name);
         let rows = read_rows(&path)?;
         let result = rows

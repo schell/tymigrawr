@@ -57,7 +57,7 @@ impl MigrateEntireTable for Sqlite {
         connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
         fields: Vec<CrudField>,
-    ) -> TymResult<Vec<crate::ReadResult<'a, Self::Error>>, Self::Error> {
+    ) -> TymResult<Vec<crate::ReadAllValuesResult<'a, Self::Error>>, Self::Error> {
         let column_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         let statement = format!("SELECT * FROM {table_name};");
         let query = connection

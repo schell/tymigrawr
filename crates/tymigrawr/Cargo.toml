@@ -9,10 +9,12 @@ edition = "2021"
 default = ["backend_sqlite"]
 backend_sqlite = ["sqlite"]
 backend_toml = ["dep:toml", "dep:base64"]
+schemars = ["dep:schemars"]
 
 [dependencies]
 base64 = { version = "0.22", optional = true }
 log = "0.4"
+schemars = { version = "1.2.1", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 snafu = "0.8"
