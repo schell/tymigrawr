@@ -54,7 +54,7 @@ on-disk databases.
 1. **`IsCrudField`** — implemented by primitive column types (`i64`, `f64`, `String`,
    `Vec<u8>`, `Option<T>`). Converts between Rust values and the `Value` enum.
 2. **`HasCrudFields`** — derivable via `#[derive(HasCrudFields)]`. Describes a struct's
-   table name, column schema, and primary key. Mark one field with `#[primary_key]`.
+   table name, column schema, and primary key.
 3. **`Crud<Backend>`** — blanket-implemented for all `T: HasCrudFields + Clone + 'static`.
    Provides `create`, `insert`, `read_all`, `read_where`, `read`, `update`, `delete`,
    and `migration()` methods.
@@ -107,7 +107,7 @@ the same line (K&R / Rust default).
 | Element              | Convention     | Examples                                    |
 |----------------------|----------------|---------------------------------------------|
 | Types / Traits       | `PascalCase`   | `CrudField`, `HasCrudFields`, `ValueType`   |
-| Functions / Methods  | `snake_case`   | `crud_fields`, `read_all`, `into_value`     |
+| Functions / Methods  | `snake_case`   | `crud_fields`, `read_all`, `value`          |
 | Variables            | `snake_case`   | `table_name`, `key_value`, `field_idents`   |
 | Modules              | `snake_case`   | `backend_sqlite`                            |
 | Versioned types      | Suffix `V<N>`  | `PlayerV1`, `PlayerV2`, `PlayerV3`          |
@@ -126,7 +126,6 @@ This project uses **`snafu 0.8`** with the custom error enums.
 ### Derives and Attributes
 
 - Structs that map to database tables derive `Debug, Clone, PartialEq, HasCrudFields`.
-- Mark exactly one field with `#[primary_key]` when deriving `HasCrudFields`.
 - Backend modules use `#[cfg(feature = "backend_sqlite")]`.
 - The derive macro generates `#[automatically_derived] impl HasCrudFields for ...` blocks.
 

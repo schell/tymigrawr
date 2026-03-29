@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::{
     error::{DomainError, TymResult},
     Crud, CrudBackend, CrudField, Error, HasCrudFields, HasCrudFieldsError, IsCrudField,
-    MigrateEntireTable, Migration, Value, ValueType,
+    MigrateEntireTable, Migration, ReadAllValuesResult, Value, ValueType,
 };
 
 pub struct Sqlite;
@@ -15,7 +15,9 @@ impl CrudBackend for Sqlite {
 }
 
 impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
-    /// Create a table for `Self`.
+    /// Create a table for `Self`, if it doesn't already exist.
+    ///
+    /// Implementations *must not* truncate the table if it already exists.
     fn create(
         connection: &sqlite::Connection,
     ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
@@ -156,7 +158,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
         let mut query = connection
             .prepare(statement)
             .map_err(|e| DomainError { inner: e })?;
-        let value = key_value.into_value();
+        let value = key_value.value();
         let value = sqlite::Value::from(value);
         query
             .bind((":key_value", value))
@@ -369,7 +371,7 @@ impl MigrateEntireTable for Sqlite {
         connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
         fields: Vec<CrudField>,
-    ) -> TymResult<Vec<crate::ReadAllValuesResult<'a, Self::Error>>, Self::Error> {
+    ) -> TymResult<Vec<ReadAllValuesResult<'a, Self::Error>>, Self::Error> {
         let column_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         let statement = format!("SELECT * FROM {table_name};");
         let query = connection

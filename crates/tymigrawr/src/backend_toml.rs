@@ -325,7 +325,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
         comparison: &'a str,
         key_value: impl IsCrudField,
     ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, TomlError>> + 'a>, TomlError> {
-        let rhs = key_value.into_value();
+        let rhs = key_value.value();
         let cursor = Toml::read_all_values(connection, Self::table_name(), Self::crud_fields())?;
         let iter = cursor.into_iter().filter_map(move |cols| match cols {
             Ok(ref map) => {

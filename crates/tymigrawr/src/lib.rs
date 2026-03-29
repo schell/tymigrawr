@@ -1,13 +1,78 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    marker::PhantomData,
-    ops::{Deref, DerefMut},
-};
+//! A type-safe, versioned data persistence library.
+//!
+//! `tymigrawr` enables you to define database schemas as versioned types (`PlayerV1`, `PlayerV2`, etc.)
+//! with automatic bidirectional migrations between versions using `From` trait implementations.
+//!
+//! ## Core Concepts
+//!
+//! - **Versioned Types**: Each schema version is a separate struct (e.g., `PlayerV1`, `PlayerV2`)
+//!   with automatic CRUD operations via the [`Crud`] trait.
+//! - **Trait-Based Schema**: The [`HasCrudFields`] trait describes table structure, primary keys,
+//!   and field metadata.
+//! - **Type-Erased Migrations**: The [`Migrations`] builder chains versions and executes migrations
+//!   by type-erasing previous types and automatically converting via `From` implementations.
+//! - **Backend Abstraction**: Multiple storage backends (SQLite, TOML) via the [`CrudBackend`] trait.
+//!
+//! ## Usage Example
+//!
+//! ```rust
+//! use tymigrawr::{HasCrudFields, PrimaryKey, Crud, Migrations, Sqlite};
+//!
+//! // Define version 1
+//! #[derive(Debug, Clone, HasCrudFields)]
+//! struct PlayerV1 {
+//!     id: PrimaryKey<i64>,
+//!     name: String,
+//! }
+//!
+//! // Define version 2 with additional field
+//! #[derive(Debug, Clone, HasCrudFields)]
+//! struct PlayerV2 {
+//!     id: PrimaryKey<i64>,
+//!     name: String,
+//!     age: f32,
+//! }
+//!
+//! // Implement migration from V1 to V2
+//! impl From<PlayerV1> for PlayerV2 {
+//!     fn from(v1: PlayerV1) -> Self {
+//!         PlayerV2 {
+//!             id: v1.id,
+//!             name: v1.name,
+//!             age: 0.0,
+//!         }
+//!     }
+//! }
+//!
+//! // Create the backend connection
+//! let conn = sqlite::open(":memory:").unwrap();
+//!
+//! // Use version 1
+//! PlayerV1::create(&conn).unwrap();
+//! let player = PlayerV1 {
+//!     id: PrimaryKey::new(1),
+//!     name: "Alice".to_string(),
+//! };
+//! player.insert(&conn).unwrap();
+//!
+//! // Use version 2
+//! PlayerV2::create(&conn).unwrap();
+//!
+//! // Run migrations
+//! let migrations = Migrations::<PlayerV1, Sqlite>::default()
+//!     .with_version::<PlayerV2>();
+//! migrations.run(&conn).unwrap();
+//! ```
 
-use snafu::prelude::*;
-
+mod crud;
+mod crud_fields;
 pub mod error;
+mod migrations;
+
+pub use crud::*;
+pub use crud_fields::*;
 pub use error::Error;
+pub use migrations::*;
 pub use tymigrawr_derive::HasCrudFields;
 
 #[cfg(feature = "backend_sqlite")]
@@ -20,868 +85,11 @@ mod backend_toml;
 #[cfg(feature = "backend_toml")]
 pub use backend_toml::*;
 
-use crate::error::TymResult;
-
-#[derive(Default)]
-pub enum ValueType {
-    #[default]
-    Integer,
-    Float,
-    String,
-    Bytes,
-}
-
-#[derive(Default)]
-pub struct CrudField {
-    pub name: &'static str,
-    pub ty: ValueType,
-    pub nullable: bool,
-    pub primary_key: bool,
-    pub auto_increment: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Integer(i64),
-    Float(f64),
-    String(String),
-    Bytes(Vec<u8>),
-    None,
-}
-
-impl From<i64> for Value {
-    fn from(value: i64) -> Self {
-        Value::Integer(value)
-    }
-}
-
-impl From<f64> for Value {
-    fn from(value: f64) -> Self {
-        Value::Float(value)
-    }
-}
-
-impl From<String> for Value {
-    fn from(value: String) -> Self {
-        Value::String(value)
-    }
-}
-
-impl From<Vec<u8>> for Value {
-    fn from(value: Vec<u8>) -> Self {
-        Value::Bytes(value)
-    }
-}
-
-impl<T> From<Option<T>> for Value
-where
-    Value: From<T>,
-{
-    fn from(value: Option<T>) -> Self {
-        value.map(Value::from).unwrap_or(Value::None)
-    }
-}
-
-impl Value {
-    pub fn as_i64(&self) -> Option<i64> {
-        if let Value::Integer(i) = self {
-            Some(*i)
-        } else {
-            None
-        }
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        if let Value::Float(i) = self {
-            Some(*i)
-        } else {
-            None
-        }
-    }
-
-    pub fn as_string(&self) -> Option<&String> {
-        if let Value::String(i) = self {
-            Some(i)
-        } else {
-            None
-        }
-    }
-
-    pub fn as_bytes(&self) -> Option<&[u8]> {
-        if let Value::Bytes(i) = self {
-            Some(i)
-        } else {
-            None
-        }
-    }
-}
-
-pub trait IsCrudField: Sized {
-    type MaybeSelf;
-
-    fn field() -> CrudField;
-    #[allow(clippy::wrong_self_convention)]
-    fn into_value(&self) -> Value;
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf;
-}
-
-impl IsCrudField for i64 {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        (*self).into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Option<Self> {
-        value.as_i64()
-    }
-}
-
-impl IsCrudField for i32 {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        let i = i64::from(*self);
-        i.into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Option<Self> {
-        let i = value.as_i64()?;
-        let i = i32::try_from(i).ok()?;
-        Some(i)
-    }
-}
-
-impl IsCrudField for u32 {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        let i = i64::from(*self);
-        i.into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        let i = value.as_i64()?;
-        u32::try_from(i).ok()
-    }
-}
-
-impl IsCrudField for bool {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        let i: i64 = if *self { 1 } else { 0 };
-        i.into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Option<Self> {
-        let i = value.as_i64()?;
-        Some(i != 0)
-    }
-}
-
-impl IsCrudField for String {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::String,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        self.clone().into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Option<Self> {
-        value.as_string().cloned()
-    }
-}
-
-impl IsCrudField for f64 {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Float,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        (*self).into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Option<Self> {
-        value.as_f64()
-    }
-}
-
-impl IsCrudField for f32 {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Float,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        (*self as f64).into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Option<Self> {
-        let f = value.as_f64()?;
-        Some(f as f32)
-    }
-}
-
-impl IsCrudField for Vec<u8> {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Bytes,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        self.clone().into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Option<Self> {
-        let bytes = value.as_bytes()?;
-        Some(bytes.to_vec())
-    }
-}
-
-impl<T: IsCrudField> IsCrudField for Option<T> {
-    type MaybeSelf = T::MaybeSelf;
-
-    fn field() -> CrudField {
-        let mut cf = T::field();
-        cf.nullable = true;
-        cf
-    }
-
-    fn into_value(&self) -> Value {
-        self.as_ref().map(T::into_value).unwrap_or(Value::None)
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        T::maybe_from_value(value)
-    }
-}
-
-/// A non-auto-incrementing primary key with an explicit value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PrimaryKey<T> {
-    pub inner: T,
-}
-
-impl<T> Deref for PrimaryKey<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<T> DerefMut for PrimaryKey<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-#[cfg(feature = "schemars")]
-impl<T: schemars::JsonSchema> schemars::JsonSchema for PrimaryKey<T> {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        T::schema_name()
-    }
-
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        T::json_schema(generator)
-    }
-}
-
-impl<T> PrimaryKey<T> {
-    pub fn new(value: T) -> Self {
-        Self { inner: value }
-    }
-}
-
-/// An auto-incrementing primary key. Use `default()` to generate, or `new(value)` for explicit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AutoPrimaryKey<T> {
-    pub inner: Option<T>,
-}
-
-impl<T> Deref for AutoPrimaryKey<T> {
-    type Target = Option<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<T: Default> Default for AutoPrimaryKey<T> {
-    fn default() -> Self {
-        Self { inner: None }
-    }
-}
-
-impl<T> AutoPrimaryKey<T> {
-    /// Create a new value with key `T`.
-    pub fn new(value: T) -> Self {
-        Self { inner: Some(value) }
-    }
-
-    /// Return the key, if any.
-    pub fn key(&self) -> Option<&T> {
-        self.inner.as_ref()
-    }
-}
-
-#[cfg(feature = "schemars")]
-impl<T: schemars::JsonSchema> schemars::JsonSchema for AutoPrimaryKey<T> {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        Option::<T>::schema_name()
-    }
-
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        Option::<T>::json_schema(generator)
-    }
-}
-
-// IsCrudField implementations for PrimaryKey<T>
-
-impl IsCrudField for PrimaryKey<i64> {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            primary_key: true,
-            auto_increment: false,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        self.inner.into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        value.as_i64().map(|i| PrimaryKey { inner: i })
-    }
-}
-
-impl IsCrudField for PrimaryKey<i32> {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            primary_key: true,
-            auto_increment: false,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        let i = i64::from(self.inner);
-        i.into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        let i = value.as_i64()?;
-        let i = i32::try_from(i).ok()?;
-        Some(PrimaryKey { inner: i })
-    }
-}
-
-impl IsCrudField for PrimaryKey<u32> {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            primary_key: true,
-            auto_increment: false,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        let i = i64::from(self.inner);
-        i.into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        let i = value.as_i64()?;
-        u32::try_from(i).ok().map(|u| PrimaryKey { inner: u })
-    }
-}
-
-impl IsCrudField for PrimaryKey<String> {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::String,
-            primary_key: true,
-            auto_increment: false,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        Value::String(self.inner.clone())
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        Some(PrimaryKey {
-            inner: value.as_string()?.clone(),
-        })
-    }
-}
-
-// IsCrudField implementations for AutoPrimaryKey<T>
-
-impl IsCrudField for AutoPrimaryKey<i64> {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            primary_key: true,
-            auto_increment: true,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        self.inner.into()
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        value.as_i64().map(|i| AutoPrimaryKey { inner: Some(i) })
-    }
-}
-
-impl IsCrudField for AutoPrimaryKey<i32> {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            primary_key: true,
-            auto_increment: true,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        match self.inner {
-            Some(v) => {
-                let i = i64::from(v);
-                i.into()
-            }
-            None => Value::None,
-        }
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        match value {
-            Value::Integer(i) => {
-                let i32_val = i32::try_from(*i).ok()?;
-                Some(AutoPrimaryKey {
-                    inner: Some(i32_val),
-                })
-            }
-            Value::None => Some(AutoPrimaryKey { inner: None }),
-            _ => None,
-        }
-    }
-}
-
-impl IsCrudField for AutoPrimaryKey<u32> {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::Integer,
-            primary_key: true,
-            auto_increment: true,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        match self.inner {
-            Some(v) => {
-                let i = i64::from(v);
-                i.into()
-            }
-            None => Value::None,
-        }
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        match value {
-            Value::Integer(i) => {
-                let u32_val = u32::try_from(*i).ok()?;
-                Some(AutoPrimaryKey {
-                    inner: Some(u32_val),
-                })
-            }
-            Value::None => Some(AutoPrimaryKey { inner: None }),
-            _ => None,
-        }
-    }
-}
-
-/// A JSON-serialized field. Any type implementing `serde::Serialize` and
-/// `serde::Deserialize` can be wrapped in `JsonText<T>` to be stored as JSON text in the database.
-#[derive(Debug, Clone, PartialEq)]
-pub struct JsonText<T> {
-    pub inner: T,
-}
-
-#[cfg(feature = "schemars")]
-impl<T: schemars::JsonSchema> schemars::JsonSchema for JsonText<T> {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        T::schema_name()
-    }
-
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        T::json_schema(generator)
-    }
-}
-
-impl<T: serde::Serialize + serde::de::DeserializeOwned> IsCrudField for JsonText<T> {
-    type MaybeSelf = Option<Self>;
-
-    fn field() -> CrudField {
-        CrudField {
-            ty: ValueType::String,
-            ..Default::default()
-        }
-    }
-
-    fn into_value(&self) -> Value {
-        match serde_json::to_string(&self.inner) {
-            Ok(json) => Value::String(json),
-            Err(e) => {
-                // Serialize errors should be caught during development
-                panic!("failed to serialize JsonText field: {}", e)
-            }
-        }
-    }
-
-    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
-        match value {
-            Value::String(s) => match serde_json::from_str::<T>(s) {
-                Ok(inner) => Some(JsonText { inner }),
-                Err(e) => {
-                    // Log the error but return None to indicate failure
-                    // The caller can decide how to handle deserialization failure
-                    eprintln!("failed to deserialize JsonText field: {}", e);
-                    None
-                }
-            },
-            Value::None => None,
-            _ => None,
-        }
-    }
-}
-
-impl<T> JsonText<T> {
-    pub fn new(value: T) -> Self {
-        Self { inner: value }
-    }
-}
-
-#[derive(Debug, Snafu)]
-pub struct HasCrudFieldsError {
-    pub value: Value,
-    pub reason: String,
-}
-
-pub trait HasCrudFields: Sized {
-    fn table_name() -> &'static str;
-    fn crud_fields() -> Vec<CrudField>;
-    fn as_crud_fields(&self) -> HashMap<&str, Value>;
-    fn primary_key_name() -> &'static str;
-    fn primary_key_val(&self) -> Value;
-    fn try_from_crud_fields(fields: &HashMap<&str, Value>) -> Result<Self, HasCrudFieldsError>;
-}
-
-type FromPrevious =
-    Box<dyn Fn(Box<dyn core::any::Any + 'static>) -> Box<dyn core::any::Any + 'static> + 'static>;
-
-type AsCrudFields =
-    Box<dyn for<'a> Fn(&'a Box<dyn core::any::Any + 'static>) -> HashMap<&'a str, Value> + 'static>;
-
-type TryFromCrudFields<E> =
-    Box<dyn Fn(&HashMap<&str, Value>) -> TymResult<Box<dyn core::any::Any + 'static>, E> + 'static>;
-
-pub struct Migration<E: core::fmt::Display + core::fmt::Debug + 'static> {
-    table_name: Box<dyn Fn() -> &'static str>,
-    crud_fields: Box<dyn Fn() -> Vec<CrudField>>,
-    from_prev: FromPrevious,
-    as_crud_fields: AsCrudFields,
-    try_from_crud_fields: TryFromCrudFields<E>,
-}
-
-pub trait CrudBackend {
-    type Connection<'a>: Copy;
-    type Error: core::fmt::Display + core::fmt::Debug + 'static;
-}
-
-type ReadAllResult<'a, T, Backend> = Result<
-    Box<dyn Iterator<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>,
-    Error<<Backend as CrudBackend>::Error>,
->;
-
-type ReadWhereResult<'a, T, Backend> = Result<
-    Box<dyn Iterator<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>,
-    Error<<Backend as CrudBackend>::Error>,
->;
-
-type ReadResult<'a, T, Backend> = Result<
-    Box<dyn Iterator<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>,
-    Error<<Backend as CrudBackend>::Error>,
->;
-
-pub trait Crud<Backend>
-where
-    Self: HasCrudFields + Clone + Sized + 'static,
-    Backend: CrudBackend,
-{
-    /// Create a table for `Self`.
-    fn create(connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
-
-    fn insert(
-        &self,
-        connection: Backend::Connection<'_>,
-    ) -> std::result::Result<(), Error<Backend::Error>>;
-
-    /// Insert the row, or update all non-primary-key columns if a row with
-    /// the same primary key already exists.  Returns `true` when at least one
-    /// row was inserted or updated.
-    fn upsert(
-        &self,
-        connection: Backend::Connection<'_>,
-    ) -> std::result::Result<bool, Error<Backend::Error>>;
-
-    fn read_all<'a>(connection: Backend::Connection<'a>) -> ReadAllResult<'a, Self, Backend>;
-
-    fn read_where<'a>(
-        connection: Backend::Connection<'a>,
-        key_name: &'a str,
-        comparison: &'a str,
-        key_value: impl IsCrudField,
-    ) -> ReadWhereResult<'a, Self, Backend>;
-
-    fn read<'a, Key: IsCrudField>(
-        connection: Backend::Connection<'a>,
-        key: Key,
-    ) -> ReadResult<'a, Self, Backend>;
-
-    fn update(&self, connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
-
-    fn delete(self, connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
-
-    fn migration<T: 'static>() -> Migration<Backend::Error>
-    where
-        Self: From<T>,
-    {
-        Migration {
-            table_name: Box::new(Self::table_name),
-            crud_fields: Box::new(Self::crud_fields),
-            from_prev: Box::new(|any: Box<dyn core::any::Any>| {
-                // SAFETY: we know we can downcast because of the Self: From<T> constraint
-                let t: Box<T> = any.downcast().unwrap();
-                let s = Self::from(*t);
-                Box::new(s)
-            }),
-            as_crud_fields: Box::new(|any: &Box<dyn core::any::Any>| {
-                if let Some(t) = any.downcast_ref::<Self>() {
-                    t.as_crud_fields()
-                } else {
-                    Default::default()
-                }
-            }),
-            try_from_crud_fields: Box::new(|fields| {
-                let t = Self::try_from_crud_fields(fields)?;
-                Ok(Box::new(t))
-            }),
-        }
-    }
-}
-
-type ReadAllValuesResult<'a, E> = TymResult<HashMap<&'a str, Value>, E>;
-
-pub trait MigrateEntireTable: CrudBackend {
-    fn read_all_values<'a>(
-        connection: <Self as CrudBackend>::Connection<'a>,
-        table_name: &'a str,
-        fields: Vec<CrudField>,
-    ) -> TymResult<Vec<ReadAllValuesResult<'a, Self::Error>>, Self::Error>;
-
-    fn insert_fields(
-        connection: <Self as CrudBackend>::Connection<'_>,
-        table_name: &str,
-        fields: &HashMap<&str, Value>,
-    ) -> TymResult<(), Self::Error>;
-
-    fn delete_all(
-        connection: <Self as CrudBackend>::Connection<'_>,
-        table_name: &str,
-    ) -> TymResult<(), Self::Error>;
-}
-
-pub struct Migrations<T, Backend: CrudBackend> {
-    _current: PhantomData<(T, Backend)>,
-    all: VecDeque<Migration<Backend::Error>>,
-}
-
-impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
-    Default for Migrations<T, Backend>
-{
-    fn default() -> Self {
-        Self {
-            _current: PhantomData,
-            all: Default::default(),
-        }
-        .with_version::<T>()
-    }
-}
-
-impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
-    Migrations<T, Backend>
-{
-    pub fn with_version<Next>(self) -> Migrations<Next, Backend>
-    where
-        Next: From<T> + Crud<Backend> + HasCrudFields + Clone + Sized + 'static,
-    {
-        let Self {
-            _current: _,
-            mut all,
-        } = self;
-        all.push_back(<Next as Crud<Backend>>::migration::<T>());
-        Migrations {
-            _current: PhantomData,
-            all,
-        }
-    }
-
-    pub fn run<'a>(
-        self,
-        connection: <Backend as CrudBackend>::Connection<'a>,
-    ) -> TymResult<(), Backend::Error> {
-        self.run_with(|_| connection)
-    }
-
-    pub fn run_with<'a>(
-        self,
-        mk_connection: impl Fn(&str) -> <Backend as CrudBackend>::Connection<'a>,
-    ) -> TymResult<(), Backend::Error> {
-        let Self { _current, mut all } = self;
-        log::info!(
-            "migrating {} versions of {:?}",
-            all.len(),
-            core::any::type_name::<T>()
-        );
-        while let Some(migration) = all.pop_front() {
-            if all.is_empty() {
-                break;
-            }
-            let prev_table_name = (migration.table_name)();
-            log::info!("  checking {prev_table_name}");
-            let fields = (migration.crud_fields)();
-            // Get a cursor of each value in the prev table
-            let cursor = Backend::read_all_values(
-                (mk_connection)(prev_table_name),
-                prev_table_name,
-                fields,
-            )?;
-            let mut current_table_name = prev_table_name;
-            let mut entries = 0;
-            for res_prev in cursor {
-                entries += 1;
-                let values = res_prev?;
-                // Serialize to the prev type
-                let mut prev = (migration.try_from_crud_fields)(&values)?;
-                let mut last_migration = &migration;
-                // Move the type forward with From, from the prev to the most
-                // current
-                for target in all.iter() {
-                    prev = (target.from_prev)(prev);
-                    last_migration = target;
-                }
-                // Now prev is the most current type.
-                let current = prev;
-                current_table_name = (last_migration.table_name)();
-                // Save it in the most current table, if need be.
-                if current_table_name != prev_table_name {
-                    let fields = (last_migration.as_crud_fields)(&current);
-                    Backend::insert_fields(
-                        (mk_connection)(current_table_name),
-                        current_table_name,
-                        &fields,
-                    )?;
-                }
-            }
-            log::info!("    migrated {entries} entries from {prev_table_name}",);
-            // Remove the old entries if need be
-            if current_table_name != prev_table_name {
-                log::info!("    clearing out previous table {prev_table_name}");
-                let conn = (mk_connection)(prev_table_name);
-                Backend::delete_all(conn, prev_table_name)?;
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod test {
 
     use crate::{
-        self as tymigrawr, AutoPrimaryKey, Crud, CrudBackend, HasCrudFields, IsCrudField, JsonText,
+        self as tymigrawr, AutoPrimaryKey, Crud, CrudBackend, HasCrudFields, JsonText,
         MigrateEntireTable, Migrations, PrimaryKey,
     };
 
@@ -1601,5 +809,48 @@ mod test {
             let tempdir = tempfile::tempdir().unwrap();
             test_migrate::<Toml>(|_| tempdir.path());
         }
+    }
+
+    #[test]
+    fn module_docs() {
+        use crate::{Crud, HasCrudFields, PrimaryKey, Sqlite};
+
+        /// Define a business type that can be persisted.
+        #[derive(Debug, Clone, HasCrudFields)]
+        struct User {
+            id: PrimaryKey<i64>,
+            name: String,
+        }
+
+        /// For the most part, business logic involving persistance can be generic over the backend.
+        fn run<'a, Backend: CrudBackend>(
+            conn: Backend::Connection<'a>,
+        ) -> Result<(), tymigrawr::Error<Backend::Error>>
+        where
+            User: Crud<Backend>,
+        {
+            // Create table
+            User::create(conn)?;
+
+            // Insert
+            let user = User {
+                id: PrimaryKey::new(1),
+                name: "Alice".to_string(),
+            };
+            user.insert(conn)?;
+
+            // Read
+            let users = User::read_all(conn)?;
+            for result in users {
+                let user = result?;
+                println!("{}", user.name);
+            }
+
+            Ok(())
+        }
+
+        // Then specialize on the backend at the edges of your application
+        let conn = sqlite::open(":memory:").unwrap();
+        run::<Sqlite>(&conn).unwrap();
     }
 }

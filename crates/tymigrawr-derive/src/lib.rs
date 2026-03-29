@@ -70,7 +70,7 @@ fn gen_crud_fields(
             let error = check_no_json_text_attr(atts);
             quote! {
                 #error
-                let mut #ident = <#ty>::field();
+                let mut #ident = <#ty as tymigrawr::IsCrudField>::field();
                 #ident.name = stringify!(#ident);
                 #ident
             }
@@ -96,7 +96,7 @@ fn get_primary_key(
             // Exactly one primary key field found
             (
                 quote! {stringify!(#ident)},
-                quote! {self.#ident.into_value()},
+                quote! {tymigrawr::IsCrudField::value(&self.#ident)},
             )
         }
         (Some(_), Some(_)) => {
@@ -136,7 +136,7 @@ fn gen_from_crud_fields(
                 quote! {
                     #error
                     let #ident = match fields.get(stringify!(#ident)) {
-                        Some(v) => <#ty>::maybe_from_value(v),
+                        Some(v) => <#ty as tymigrawr::IsCrudField>::maybe_from_value(v),
                         None => None,
                     };
                 }
@@ -150,7 +150,7 @@ fn gen_from_crud_fields(
                             value: tymigrawr::Value::None,
                             reason: format!("missing required field {}", stringify!(#ident)),
                         })?;
-                    let #ident = match <#ty>::maybe_from_value(#ident_value) {
+                    let #ident = match <#ty as tymigrawr::IsCrudField>::maybe_from_value(#ident_value) {
                         Some(v) => v,
                         None => {
                             return Err(tymigrawr::HasCrudFieldsError {
@@ -178,7 +178,7 @@ fn gen_as_crud_field_pairs(
             let error = check_no_json_text_attr(field_atts);
             quote! {
                 #error
-                (stringify!(#ident), self.#ident.into_value())
+                (stringify!(#ident), tymigrawr::IsCrudField::value(&self.#ident))
             }
         })
         .collect()
