@@ -668,7 +668,7 @@ mod test {
 
     fn test_migrate_4_versions<'a, B: MigrateEntireTable>(
         scenario: &str,
-        mk_connection: impl Fn(&str) -> <B as CrudBackend>::Connection<'a>,
+        conn: <B as CrudBackend>::Connection<'a>,
     ) where
         PlayerV1: Crud<B>,
         PlayerV2: Crud<B>,
@@ -676,6 +676,9 @@ mod test {
         PlayerV4: Crud<B>,
     {
         let _ = env_logger::builder().is_test(true).try_init();
+
+        // Helper to create a closure that returns the same connection regardless of table name
+        let mk_connection = |_: &str| conn;
 
         log::debug!("=== Test Scenario: {} ===", scenario);
 
@@ -687,7 +690,7 @@ mod test {
                 // Scenario A: Only V1 table exists
                 log::debug!("Scenario A: Only V1 table exists");
                 // Create the source table for test data insertion
-                <PlayerV1 as Crud<B>>::create((mk_connection)("playerv1")).unwrap();
+                <PlayerV1 as Crud<B>>::create(conn).unwrap();
 
                 let players_v1 = (0..test_data_count)
                     .map(|i| PlayerV1 {
@@ -697,7 +700,7 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v1.iter() {
-                    <PlayerV1 as Crud<B>>::insert(player, (mk_connection)("playerv1")).unwrap();
+                    <PlayerV1 as Crud<B>>::insert(player, conn).unwrap();
                 }
 
                 // Expected final data in V4
@@ -715,10 +718,10 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(&mk_connection).unwrap();
+                migrations.run_with(mk_connection).unwrap();
 
                 // Verify V1 table is empty
-                let v1_remaining = <PlayerV1 as Crud<B>>::read_all((mk_connection)("playerv1"))
+                let v1_remaining = <PlayerV1 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -729,7 +732,7 @@ mod test {
                 );
 
                 // Verify V4 table has all data
-                let v4_data = <PlayerV4 as Crud<B>>::read_all((mk_connection)("playerv4"))
+                let v4_data = <PlayerV4 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -743,7 +746,7 @@ mod test {
                 // Scenario B: Only V2 table exists
                 log::debug!("Scenario B: Only V2 table exists");
                 // Create the source table for test data insertion
-                <PlayerV2 as Crud<B>>::create((mk_connection)("playerv2")).unwrap();
+                <PlayerV2 as Crud<B>>::create(conn).unwrap();
 
                 let players_v2 = (0..test_data_count)
                     .map(|i| PlayerV2 {
@@ -754,7 +757,7 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v2.iter() {
-                    <PlayerV2 as Crud<B>>::insert(player, (mk_connection)("playerv2")).unwrap();
+                    <PlayerV2 as Crud<B>>::insert(player, conn).unwrap();
                 }
 
                 // Expected final data in V4
@@ -771,10 +774,10 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(&mk_connection).unwrap();
+                migrations.run_with(mk_connection).unwrap();
 
                 // Verify V2 table is empty
-                let v2_remaining = <PlayerV2 as Crud<B>>::read_all((mk_connection)("playerv2"))
+                let v2_remaining = <PlayerV2 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -785,7 +788,7 @@ mod test {
                 );
 
                 // Verify V4 table has all data
-                let v4_data = <PlayerV4 as Crud<B>>::read_all((mk_connection)("playerv4"))
+                let v4_data = <PlayerV4 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -799,7 +802,7 @@ mod test {
                 // Scenario C: Only V3 table exists
                 log::debug!("Scenario C: Only V3 table exists");
                 // Create the source table for test data insertion
-                <PlayerV3 as Crud<B>>::create((mk_connection)("playerv3")).unwrap();
+                <PlayerV3 as Crud<B>>::create(conn).unwrap();
 
                 let players_v3 = (0..test_data_count)
                     .map(|i| PlayerV3 {
@@ -810,7 +813,7 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v3.iter() {
-                    <PlayerV3 as Crud<B>>::insert(player, (mk_connection)("playerv3")).unwrap();
+                    <PlayerV3 as Crud<B>>::insert(player, conn).unwrap();
                 }
 
                 // Expected final data in V4
@@ -826,10 +829,10 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(&mk_connection).unwrap();
+                migrations.run_with(mk_connection).unwrap();
 
                 // Verify V3 table is empty
-                let v3_remaining = <PlayerV3 as Crud<B>>::read_all((mk_connection)("playerv3"))
+                let v3_remaining = <PlayerV3 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -840,7 +843,7 @@ mod test {
                 );
 
                 // Verify V4 table has all data
-                let v4_data = <PlayerV4 as Crud<B>>::read_all((mk_connection)("playerv4"))
+                let v4_data = <PlayerV4 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -854,7 +857,7 @@ mod test {
                 // Scenario D: Only V4 table exists (no migration needed)
                 log::debug!("Scenario D: Only V4 table exists");
                 // Create the source table for test data insertion
-                <PlayerV4 as Crud<B>>::create((mk_connection)("playerv4")).unwrap();
+                <PlayerV4 as Crud<B>>::create(conn).unwrap();
 
                 let players_v4 = (0..test_data_count)
                     .map(|i| PlayerV4 {
@@ -864,9 +867,6 @@ mod test {
                         region: "us-west".to_string(),
                     })
                     .collect::<Vec<_>>();
-
-                let conn = mk_connection(PlayerV4::table_name());
-                PlayerV4::create(conn).unwrap();
 
                 for player in players_v4.iter() {
                     PlayerV4::insert(player, conn).unwrap();
@@ -878,7 +878,7 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(&mk_connection).unwrap();
+                migrations.run_with(mk_connection).unwrap();
 
                 // Verify V4 table still has all data
                 let v4_data = PlayerV4::read_all(conn)
@@ -895,8 +895,8 @@ mod test {
                 // Scenario E: Both V1 and V3 tables exist
                 log::debug!("Scenario E: Both V1 and V3 tables exist");
                 // Create the source tables for test data insertion
-                <PlayerV1 as Crud<B>>::create((mk_connection)("playerv1")).unwrap();
-                <PlayerV3 as Crud<B>>::create((mk_connection)("playerv3")).unwrap();
+                <PlayerV1 as Crud<B>>::create(conn).unwrap();
+                <PlayerV3 as Crud<B>>::create(conn).unwrap();
 
                 let players_v1 = (0..5)
                     .map(|i| PlayerV1 {
@@ -914,10 +914,10 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v1.iter() {
-                    <PlayerV1 as Crud<B>>::insert(player, (mk_connection)("playerv1")).unwrap();
+                    <PlayerV1 as Crud<B>>::insert(player, conn).unwrap();
                 }
                 for player in players_v3.iter() {
-                    <PlayerV3 as Crud<B>>::insert(player, (mk_connection)("playerv3")).unwrap();
+                    <PlayerV3 as Crud<B>>::insert(player, conn).unwrap();
                 }
 
                 // Expected final data in V4 (both sources converted)
@@ -944,10 +944,10 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(&mk_connection).unwrap();
+                migrations.run_with(mk_connection).unwrap();
 
                 // Verify V1 and V3 tables are empty
-                let v1_remaining = <PlayerV1 as Crud<B>>::read_all((mk_connection)("playerv1"))
+                let v1_remaining = <PlayerV1 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -957,7 +957,7 @@ mod test {
                     "V1 table should be empty after migration"
                 );
 
-                let v3_remaining = <PlayerV3 as Crud<B>>::read_all((mk_connection)("playerv3"))
+                let v3_remaining = <PlayerV3 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -968,7 +968,7 @@ mod test {
                 );
 
                 // Verify V4 table has all data from both sources
-                let mut v4_data = <PlayerV4 as Crud<B>>::read_all((mk_connection)("playerv4"))
+                let mut v4_data = <PlayerV4 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -984,7 +984,7 @@ mod test {
                 // Scenario F: Reverse migration (V4 -> V1)
                 log::debug!("Scenario F: Reverse migration V4 -> V1");
                 // Create the source table for test data insertion
-                <PlayerV4 as Crud<B>>::create((mk_connection)("playerv4")).unwrap();
+                <PlayerV4 as Crud<B>>::create(conn).unwrap();
 
                 let players_v4 = (0..test_data_count)
                     .map(|i| PlayerV4 {
@@ -996,7 +996,7 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v4.iter() {
-                    <PlayerV4 as Crud<B>>::insert(player, (mk_connection)("playerv4")).unwrap();
+                    <PlayerV4 as Crud<B>>::insert(player, conn).unwrap();
                 }
 
                 // Expected final data in V1 (reverse converted)
@@ -1014,10 +1014,10 @@ mod test {
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV1>();
-                migrations.run_with(&mk_connection).unwrap();
+                migrations.run_with(mk_connection).unwrap();
 
                 // Verify V4 table is empty
-                let v4_remaining = <PlayerV4 as Crud<B>>::read_all((mk_connection)("playerv4"))
+                let v4_remaining = <PlayerV4 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -1028,7 +1028,7 @@ mod test {
                 );
 
                 // Verify V1 table has all data
-                let v1_data = <PlayerV1 as Crud<B>>::read_all((mk_connection)("playerv1"))
+                let v1_data = <PlayerV1 as Crud<B>>::read_all(conn)
                     .unwrap()
                     .map(|r| r.unwrap())
                     .collect::<Vec<_>>();
@@ -1161,68 +1161,38 @@ mod test {
 
         #[test]
         fn migrate_4_versions_v1_only() {
-            let tempdir = tempfile::tempdir().unwrap();
-            let mut conns = std::collections::HashMap::new();
-            for version in &["playerv1", "playerv2", "playerv3", "playerv4"] {
-                let path = tempdir.path().join(format!("{}.db", version));
-                conns.insert(*version, sqlite::open(path).unwrap());
-            }
-            test_migrate_4_versions::<Sqlite>("v1_only", |table| conns.get(table).unwrap());
+            let conn = sqlite::open(":memory:").unwrap();
+            test_migrate_4_versions::<Sqlite>("v1_only", &conn);
         }
 
         #[test]
         fn migrate_4_versions_v2_only() {
-            let tempdir = tempfile::tempdir().unwrap();
-            let mut conns = std::collections::HashMap::new();
-            for version in &["playerv1", "playerv2", "playerv3", "playerv4"] {
-                let path = tempdir.path().join(format!("{}.db", version));
-                conns.insert(*version, sqlite::open(path).unwrap());
-            }
-            test_migrate_4_versions::<Sqlite>("v2_only", |table| conns.get(table).unwrap());
+            let conn = sqlite::open(":memory:").unwrap();
+            test_migrate_4_versions::<Sqlite>("v2_only", &conn);
         }
 
         #[test]
         fn migrate_4_versions_v3_only() {
-            let tempdir = tempfile::tempdir().unwrap();
-            let mut conns = std::collections::HashMap::new();
-            for version in &["playerv1", "playerv2", "playerv3", "playerv4"] {
-                let path = tempdir.path().join(format!("{}.db", version));
-                conns.insert(*version, sqlite::open(path).unwrap());
-            }
-            test_migrate_4_versions::<Sqlite>("v3_only", |table| conns.get(table).unwrap());
+            let conn = sqlite::open(":memory:").unwrap();
+            test_migrate_4_versions::<Sqlite>("v3_only", &conn);
         }
 
         #[test]
         fn migrate_4_versions_v4_only() {
-            let tempdir = tempfile::tempdir().unwrap();
-            let mut conns = std::collections::HashMap::new();
-            for version in &["playerv1", "playerv2", "playerv3", "playerv4"] {
-                let path = tempdir.path().join(format!("{}.db", version));
-                conns.insert(*version, sqlite::open(path).unwrap());
-            }
-            test_migrate_4_versions::<Sqlite>("v4_only", |table| conns.get(table).unwrap());
+            let conn = sqlite::open(":memory:").unwrap();
+            test_migrate_4_versions::<Sqlite>("v4_only", &conn);
         }
 
         #[test]
         fn migrate_4_versions_v1_v3_mix() {
-            let tempdir = tempfile::tempdir().unwrap();
-            let mut conns = std::collections::HashMap::new();
-            for version in &["playerv1", "playerv2", "playerv3", "playerv4"] {
-                let path = tempdir.path().join(format!("{}.db", version));
-                conns.insert(*version, sqlite::open(path).unwrap());
-            }
-            test_migrate_4_versions::<Sqlite>("v1_v3_mix", |table| conns.get(table).unwrap());
+            let conn = sqlite::open(":memory:").unwrap();
+            test_migrate_4_versions::<Sqlite>("v1_v3_mix", &conn);
         }
 
         #[test]
         fn migrate_4_versions_reverse() {
-            let tempdir = tempfile::tempdir().unwrap();
-            let mut conns = std::collections::HashMap::new();
-            for version in &["playerv1", "playerv2", "playerv3", "playerv4"] {
-                let path = tempdir.path().join(format!("{}.db", version));
-                conns.insert(*version, sqlite::open(path).unwrap());
-            }
-            test_migrate_4_versions::<Sqlite>("reverse", |table| conns.get(table).unwrap());
+            let conn = sqlite::open(":memory:").unwrap();
+            test_migrate_4_versions::<Sqlite>("reverse", &conn);
         }
     }
 
@@ -1264,37 +1234,37 @@ mod test {
         #[test]
         fn migrate_4_versions_v1_only() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v1_only", |_| tempdir.path());
+            test_migrate_4_versions::<Toml>("v1_only", tempdir.path());
         }
 
         #[test]
         fn migrate_4_versions_v2_only() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v2_only", |_| tempdir.path());
+            test_migrate_4_versions::<Toml>("v2_only", tempdir.path());
         }
 
         #[test]
         fn migrate_4_versions_v3_only() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v3_only", |_| tempdir.path());
+            test_migrate_4_versions::<Toml>("v3_only", tempdir.path());
         }
 
         #[test]
         fn migrate_4_versions_v4_only() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v4_only", |_| tempdir.path());
+            test_migrate_4_versions::<Toml>("v4_only", tempdir.path());
         }
 
         #[test]
         fn migrate_4_versions_v1_v3_mix() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v1_v3_mix", |_| tempdir.path());
+            test_migrate_4_versions::<Toml>("v1_v3_mix", tempdir.path());
         }
 
         #[test]
         fn migrate_4_versions_reverse() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("reverse", |_| tempdir.path());
+            test_migrate_4_versions::<Toml>("reverse", tempdir.path());
         }
     }
 
