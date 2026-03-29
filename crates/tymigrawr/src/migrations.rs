@@ -16,12 +16,12 @@ type TryFromCrudFields<E> =
     Box<dyn Fn(&HashMap<&str, Value>) -> TymResult<Box<dyn core::any::Any + 'static>, E> + 'static>;
 
 /// Represents a migration of one type through any number of versions.
-pub struct Migration<E: core::fmt::Display + core::fmt::Debug + 'static> {
+pub struct Migration<Backend: CrudBackend> {
     pub(crate) table_name: Box<dyn Fn() -> &'static str>,
     pub(crate) crud_fields: Box<dyn Fn() -> Vec<CrudField>>,
     pub(crate) from_prev: FromPrevious,
     pub(crate) as_crud_fields: AsCrudFields,
-    pub(crate) try_from_crud_fields: TryFromCrudFields<E>,
+    pub(crate) try_from_crud_fields: TryFromCrudFields<Backend::Error>,
 }
 
 pub(crate) type ReadAllValuesResult<'a, E> = TymResult<HashMap<&'a str, Value>, E>;
@@ -35,6 +35,21 @@ pub trait MigrateEntireTable: CrudBackend {
     ///
     /// Returns a vector of results, where each result is either a map of column values
     /// or an error from the backend.
+    ///
+    /// # Implementation Notes for Backends
+    ///
+    /// If the table does not exist, implementations **must return an empty vector** instead of
+    /// returning an error. This is critical for the migration system to work correctly:
+    ///
+    /// - Users should be able to run a migration chain (e.g., V1 → V4) against a database
+    ///   that only contains data from an intermediate version (e.g., only V2 exists).
+    /// - The semantics of "table doesn't exist" and "table is empty" are equivalent in the
+    ///   context of migrations: both mean "no rows to migrate from this version".
+    /// - Implementations should log at debug level when a table is not found to help users
+    ///   understand which versions were processed during migration.
+    ///
+    /// Errors should only be returned for actual backend failures (I/O errors, corruption, etc.),
+    /// not for missing tables.
     fn read_all_values<'a>(
         connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
@@ -90,7 +105,7 @@ pub trait MigrateEntireTable: CrudBackend {
 /// ```
 pub struct Migrations<T, Backend: CrudBackend> {
     _current: PhantomData<(T, Backend)>,
-    all: VecDeque<Migration<Backend::Error>>,
+    all: VecDeque<Migration<Backend>>,
 }
 
 impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: MigrateEntireTable>
@@ -170,12 +185,19 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
             all.len(),
             core::any::type_name::<T>()
         );
+
+        let destination_table_name = T::table_name();
+        // Ensure the destination table exists
+        {
+            T::create(mk_connection(destination_table_name))?;
+        }
         while let Some(migration) = all.pop_front() {
             if all.is_empty() {
+                log::debug!("  ...done");
                 break;
             }
             let prev_table_name = (migration.table_name)();
-            log::info!("  checking {prev_table_name}");
+            log::debug!("  checking {prev_table_name}");
             let fields = (migration.crud_fields)();
             // Get a cursor of each value in the prev table
             let cursor = Backend::read_all_values(
@@ -187,21 +209,26 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
             let mut entries = 0;
             for res_prev in cursor {
                 entries += 1;
+                log::trace!("  entry {entries}");
                 let values = res_prev?;
                 // Serialize to the prev type
                 let mut prev = (migration.try_from_crud_fields)(&values)?;
                 let mut last_migration = &migration;
                 // Move the type forward with From, from the prev to the most
                 // current
+                let mut conversions = 0;
                 for target in all.iter() {
+                    conversions += 1;
                     prev = (target.from_prev)(prev);
                     last_migration = target;
                 }
+                log::trace!("    converted entry {entries} {conversions} times from {current_table_name} to {}", (last_migration.table_name)());
                 // Now prev is the most current type.
                 let current = prev;
                 current_table_name = (last_migration.table_name)();
                 // Save it in the most current table, if need be.
                 if current_table_name != prev_table_name {
+                    log::trace!("    inserting into {current_table_name}");
                     let fields = (last_migration.as_crud_fields)(&current);
                     Backend::insert_fields(
                         (mk_connection)(current_table_name),
@@ -210,10 +237,12 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
                     )?;
                 }
             }
-            log::info!("    migrated {entries} entries from {prev_table_name}",);
+            log::debug!(
+                "    migrated {entries} entries from {prev_table_name} to {destination_table_name}",
+            );
             // Remove the old entries if need be
             if current_table_name != prev_table_name {
-                log::info!("    clearing out previous table {prev_table_name}");
+                log::debug!("    clearing out previous table {prev_table_name}");
                 let conn = (mk_connection)(prev_table_name);
                 Backend::delete_all(conn, prev_table_name)?;
             }

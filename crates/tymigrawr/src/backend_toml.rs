@@ -210,6 +210,12 @@ impl MigrateEntireTable for Toml {
         fields: Vec<CrudField>,
     ) -> TymResult<Vec<crate::ReadAllValuesResult<'a, Self::Error>>, Self::Error> {
         let path = table_path(connection, table_name);
+
+        // Check if the file exists; log if it doesn't
+        if !path.exists() {
+            log::debug!("Table {table_name} does not exist, no rows to migrate");
+        }
+
         let rows = read_rows(&path)?;
         let result = rows
             .into_iter()
@@ -430,7 +436,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
         Ok(())
     }
 
-    fn migration<S: 'static>() -> Migration<TomlError>
+    fn migration<S: 'static>() -> Migration<Toml>
     where
         Self: From<S>,
     {

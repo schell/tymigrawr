@@ -6,8 +6,6 @@ use std::{
 
 use snafu::prelude::*;
 
-use crate::error::TymResult;
-
 /// Represents the database type of a CRUD field.
 ///
 /// This enum categorizes all supported column types in the database. Each variant corresponds

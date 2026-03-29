@@ -7,7 +7,7 @@ use crate::{crud_fields::*, error::*, Migration};
 /// Each backend (SQLite, TOML, PostgreSQL, etc.) implements this trait to provide
 /// a connection type and an error type. This abstraction allows the [`Crud`] trait
 /// to be backend-agnostic.
-pub trait CrudBackend {
+pub trait CrudBackend: 'static {
     /// The connection type for this backend.
     ///
     /// Must be `Copy` so it can be passed around easily. Implementations typically
@@ -157,7 +157,7 @@ where
     ///
     /// This is used internally by the [`Migrations`] builder to chain version upgrades.
     /// Requires that `Self` implements `From<T>`.
-    fn migration<T: 'static>() -> Migration<Backend::Error>
+    fn migration<T: 'static>() -> Migration<Backend>
     where
         Self: From<T>,
     {

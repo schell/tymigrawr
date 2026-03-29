@@ -292,7 +292,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
         Ok(())
     }
 
-    fn migration<S: 'static>() -> Migration<sqlite::Error>
+    fn migration<S: 'static>() -> Migration<Sqlite>
     where
         Self: From<S>,
     {
@@ -374,9 +374,22 @@ impl MigrateEntireTable for Sqlite {
     ) -> TymResult<Vec<ReadAllValuesResult<'a, Self::Error>>, Self::Error> {
         let column_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         let statement = format!("SELECT * FROM {table_name};");
-        let query = connection
-            .prepare(statement)
-            .map_err(|e| DomainError { inner: e })?;
+
+        // Attempt to prepare the statement. If the table doesn't exist, return empty results.
+        let query = match connection.prepare(&statement) {
+            Ok(q) => q,
+            Err(e)
+                if e.message
+                    .as_deref()
+                    .map(|m| m.contains("no such table"))
+                    .unwrap_or(false) =>
+            {
+                log::debug!("table {table_name} does not exist");
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(DomainError { inner: e }.into()),
+        };
+
         let cursor = query
             .into_iter()
             .map(
