@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     marker::PhantomData,
+    ops::{Deref, DerefMut},
 };
 
 use snafu::prelude::*;
@@ -309,6 +310,20 @@ pub struct PrimaryKey<T> {
     pub inner: T,
 }
 
+impl<T> Deref for PrimaryKey<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T> DerefMut for PrimaryKey<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 #[cfg(feature = "schemars")]
 impl<T: schemars::JsonSchema> schemars::JsonSchema for PrimaryKey<T> {
     fn schema_name() -> std::borrow::Cow<'static, str> {
@@ -332,15 +347,29 @@ pub struct AutoPrimaryKey<T> {
     pub inner: Option<T>,
 }
 
-impl<T> AutoPrimaryKey<T> {
-    pub fn new(value: T) -> Self {
-        Self { inner: Some(value) }
+impl<T> Deref for AutoPrimaryKey<T> {
+    type Target = Option<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
 impl<T: Default> Default for AutoPrimaryKey<T> {
     fn default() -> Self {
         Self { inner: None }
+    }
+}
+
+impl<T> AutoPrimaryKey<T> {
+    /// Create a new value with key `T`.
+    pub fn new(value: T) -> Self {
+        Self { inner: Some(value) }
+    }
+
+    /// Return the key, if any.
+    pub fn key(&self) -> Option<&T> {
+        self.inner.as_ref()
     }
 }
 
@@ -422,6 +451,29 @@ impl IsCrudField for PrimaryKey<u32> {
     fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
         let i = value.as_i64()?;
         u32::try_from(i).ok().map(|u| PrimaryKey { inner: u })
+    }
+}
+
+impl IsCrudField for PrimaryKey<String> {
+    type MaybeSelf = Option<Self>;
+
+    fn field() -> CrudField {
+        CrudField {
+            ty: ValueType::String,
+            primary_key: true,
+            auto_increment: false,
+            ..Default::default()
+        }
+    }
+
+    fn into_value(&self) -> Value {
+        Value::String(self.inner.clone())
+    }
+
+    fn maybe_from_value(value: &Value) -> Self::MaybeSelf {
+        Some(PrimaryKey {
+            inner: value.as_string()?.clone(),
+        })
     }
 }
 
