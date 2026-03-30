@@ -369,7 +369,9 @@ impl<T: IsCrudField> IsCrudField for Option<T> {
 ///     name: "Alice".to_string(),
 /// };
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
 pub struct PrimaryKey<T> {
     /// The primary key value.
     pub inner: T,
@@ -438,7 +440,9 @@ impl<T> PrimaryKey<T> {
 ///     name: "Bob".to_string(),
 /// };
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
 pub struct AutoPrimaryKey<T> {
     /// The primary key value, or `None` if it hasn't been assigned yet.
     pub inner: Option<T>,
@@ -697,7 +701,9 @@ impl IsCrudField for AutoPrimaryKey<u32> {
 ///     tags: JsonText<Tags>,
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
 pub struct JsonText<T> {
     /// The inner value, which will be serialized to JSON when stored.
     pub inner: T,
