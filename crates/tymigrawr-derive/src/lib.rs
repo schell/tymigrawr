@@ -81,22 +81,32 @@ fn gen_crud_fields(
 fn get_primary_key(
     idents: &[Ident],
     tys: &[Type],
-) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+) -> (
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+) {
     // Find the field with PrimaryKey<T> or AutoPrimaryKey<T> type
     let mut primary_keys = idents.iter().zip(tys.iter()).filter_map(|(ident, ty)| {
         if is_primary_key_type(ty) {
-            Some(ident.clone())
+            Some((ident.clone(), ty.clone()))
         } else {
             None
         }
     });
 
     match (primary_keys.next(), primary_keys.next()) {
-        (Some(ident), None) => {
+        (Some((ident, ty)), None) => {
             // Exactly one primary key field found
+            let set_impl = quote! {
+                if let Some(pk) = <#ty as tymigrawr::IsCrudField>::maybe_from_value(&value) {
+                    self.#ident = pk;
+                }
+            };
             (
                 quote! {stringify!(#ident)},
                 quote! {tymigrawr::IsCrudField::value(&self.#ident)},
+                set_impl,
             )
         }
         (Some(_), Some(_)) => {
@@ -106,6 +116,7 @@ fn get_primary_key(
                     compile_error!("struct must have exactly one primary key field (PrimaryKey<T> or AutoPrimaryKey<T>)")
                 },
                 quote! {},
+                quote! {},
             )
         }
         (None, _) => {
@@ -114,6 +125,7 @@ fn get_primary_key(
                 quote! {
                     compile_error!("struct must have exactly one primary key field (PrimaryKey<T> or AutoPrimaryKey<T>)")
                 },
+                quote! {},
                 quote! {},
             )
         }
@@ -213,7 +225,8 @@ pub fn derive_crud_fields(input: proc_macro::TokenStream) -> proc_macro::TokenSt
     let crud_fields = gen_crud_fields(&field_idents, &field_tys, &field_atts);
     let from_crud_fields = gen_from_crud_fields(&field_idents, &field_tys, &field_atts);
     let as_crud_field_pairs = gen_as_crud_field_pairs(&field_idents, &field_tys, &field_atts);
-    let (primary_key, primary_key_val) = get_primary_key(&field_idents, &field_tys);
+    let (primary_key, primary_key_val, set_primary_key) =
+        get_primary_key(&field_idents, &field_tys);
     let output = quote! {
         #[automatically_derived]
         impl #impl_generics tymigrawr::HasCrudFields for #name #ty_generics #where_clause {
@@ -239,6 +252,10 @@ pub fn derive_crud_fields(input: proc_macro::TokenStream) -> proc_macro::TokenSt
 
             fn primary_key_val(&self) -> tymigrawr::Value {
                 #primary_key_val
+            }
+
+            fn set_primary_key(&mut self, value: tymigrawr::Value) {
+                #set_primary_key
             }
 
             fn try_from_crud_fields(

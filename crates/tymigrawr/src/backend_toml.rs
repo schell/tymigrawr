@@ -260,13 +260,13 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
         Ok(())
     }
 
-    fn insert(&self, connection: &Path) -> TymResult<(), TomlError> {
+    fn insert(&mut self, connection: &Path) -> TymResult<(), TomlError> {
         let table_name = Self::table_name();
         let fields = self.as_crud_fields();
         Toml::insert_fields(connection, table_name, &fields)
     }
 
-    fn upsert(&self, connection: &Path) -> TymResult<bool, TomlError> {
+    fn upsert(&mut self, connection: &Path) -> TymResult<bool, TomlError> {
         let table_name = Self::table_name();
         let path = table_path(connection, table_name);
         let crud_fields = Self::crud_fields();

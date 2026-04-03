@@ -806,6 +806,11 @@ pub trait HasCrudFields: Sized {
     /// Extracts the primary key value from this instance.
     fn primary_key_val(&self) -> Value;
 
+    /// Updates the primary key value of this instance.
+    ///
+    /// This is primarily used by backends to update auto-increment primary keys after insertion.
+    fn set_primary_key(&mut self, value: Value);
+
     /// Attempts to reconstruct this type from a map of column values.
     ///
     /// Returns an error if the columns are missing or have incompatible types.

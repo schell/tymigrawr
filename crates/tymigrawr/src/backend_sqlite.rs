@@ -35,42 +35,68 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     }
 
     fn insert(
-        &self,
+        &mut self,
         connection: &sqlite::Connection,
     ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let crud_fields = Self::crud_fields();
         let mut fields = self.as_crud_fields();
 
-        // For auto_increment fields with value 0, omit them from the INSERT so SQLite generates the value
-        for field in &crud_fields {
-            if field.auto_increment {
-                if let Some(Value::Integer(0)) = fields.get(field.name) {
-                    fields.remove(field.name);
+        // Check if there's an auto_increment field and omit it if the value is None
+        let has_auto_increment = crud_fields.iter().find_map(|field| {
+            if field.auto_increment && matches!(fields.get(field.name), Some(Value::None)) {
+                fields.remove(field.name);
+                Some(field.name)
+            } else {
+                None
+            }
+        });
+
+        Sqlite::insert_fields(connection, table_name, &fields)?;
+
+        // If there was an auto_increment field with None value, update it with the generated ID
+        if has_auto_increment.is_some() {
+            // Query the last inserted rowid
+            let mut stmt = connection
+                .prepare("SELECT last_insert_rowid()")
+                .map_err(|e| DomainError { inner: e })?;
+            if matches!(stmt.next(), Ok(sqlite::State::Row)) {
+                if let Ok(rowid) = stmt.read::<i64, _>(0) {
+                    self.set_primary_key(Value::Integer(rowid));
                 }
             }
         }
 
-        Sqlite::insert_fields(connection, table_name, &fields)?;
         Ok(())
     }
 
     fn upsert(
-        &self,
+        &mut self,
         connection: &sqlite::Connection,
     ) -> Result<bool, Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let crud_fields = Self::crud_fields();
-        let field_values = self.as_crud_fields();
+        let mut field_values = self.as_crud_fields();
 
-        let columns = crud_fields
-            .iter()
-            .map(|f| f.name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let binds = crud_fields
-            .iter()
-            .map(|f| format!(":{}", f.name))
+        // Check if primary key is auto_increment and has value None
+        let auto_increment_field = crud_fields.iter().find(|f| f.auto_increment);
+        let is_new_auto_increment = if let Some(field) = auto_increment_field {
+            matches!(field_values.get(field.name), Some(Value::None))
+        } else {
+            false
+        };
+
+        // For new auto_increment records, omit the key and treat as insert
+        if is_new_auto_increment {
+            if let Some(field) = auto_increment_field {
+                field_values.remove(field.name);
+            }
+        }
+
+        let columns = field_values.keys().copied().collect::<Vec<_>>().join(", ");
+        let binds = field_values
+            .keys()
+            .map(|k| format!(":{}", k))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -91,8 +117,8 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let statement = if update_set.is_empty() {
-            // Only a primary key column — nothing to update, just ignore conflicts
+        let statement = if update_set.is_empty() || is_new_auto_increment {
+            // Only a primary key column or new auto_increment — nothing to update, just ignore conflicts
             format!(
                 "INSERT INTO {table_name} ({columns}) VALUES ({binds}) \
                  ON CONFLICT({primary_key}) DO NOTHING"
@@ -121,6 +147,18 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
                 operation: "upsert".into(),
                 reason: "query not ok".into(),
             });
+        }
+
+        // If it was a new auto_increment record, update with the generated ID
+        if is_new_auto_increment {
+            let mut stmt = connection
+                .prepare("SELECT last_insert_rowid()")
+                .map_err(|e| DomainError { inner: e })?;
+            if matches!(stmt.next(), Ok(sqlite::State::Row)) {
+                if let Ok(rowid) = stmt.read::<i64, _>(0) {
+                    self.set_primary_key(Value::Integer(rowid));
+                }
+            }
         }
 
         Ok(connection.change_count() > 0)

@@ -48,15 +48,15 @@
 //! let conn = sqlite::open(":memory:").unwrap();
 //!
 //! // Use version 1
-//! PlayerV1::create(&conn).unwrap();
-//! let player = PlayerV1 {
+//! <PlayerV1 as Crud<Sqlite>>::create(&conn).unwrap();
+//! let mut player = PlayerV1 {
 //!     id: PrimaryKey::new(1),
 //!     name: "Alice".to_string(),
 //! };
-//! player.insert(&conn).unwrap();
+//! <PlayerV1 as Crud<Sqlite>>::insert(&mut player, &conn).unwrap();
 //!
 //! // Use version 2
-//! PlayerV2::create(&conn).unwrap();
+//! <PlayerV2 as Crud<Sqlite>>::create(&conn).unwrap();
 //!
 //! // Run migrations
 //! let migrations = Migrations::<PlayerV1, Sqlite>::default()
@@ -228,18 +228,18 @@ mod test {
         PlayerV1: Crud<B>,
     {
         PlayerV1::create(conn).unwrap();
-        let first_player = PlayerV1 {
+        let mut first_player = PlayerV1 {
             id: PrimaryKey::new(0),
             name: "tymigrawr".to_string(),
         };
-        PlayerV1::insert(&first_player, conn).unwrap();
+        first_player.insert(conn).unwrap();
         let player = PlayerV1::read(conn, 0).unwrap().next().unwrap().unwrap();
         assert_eq!(first_player, player);
         let mut second_player = PlayerV1 {
             id: PrimaryKey::new(1),
             name: "developer".to_string(),
         };
-        PlayerV1::insert(&second_player, conn).unwrap();
+        second_player.insert(conn).unwrap();
         let player = PlayerV1::read(conn, 1).unwrap().next().unwrap().unwrap();
         assert_eq!(second_player, player);
 
@@ -272,11 +272,11 @@ mod test {
         PlayerV1::create(conn).unwrap();
 
         // Upsert a new row — should insert and return true
-        let player = PlayerV1 {
+        let mut player = PlayerV1 {
             id: PrimaryKey::new(42),
             name: "original".to_string(),
         };
-        let changed = PlayerV1::upsert(&player, conn).unwrap();
+        let changed = player.upsert(conn).unwrap();
         assert!(changed, "upsert of new row should return true");
 
         // Read it back
@@ -284,11 +284,11 @@ mod test {
         assert_eq!(player, from_db);
 
         // Upsert with same PK but different data — should update and return true
-        let updated = PlayerV1 {
+        let mut updated = PlayerV1 {
             id: PrimaryKey::new(42),
             name: "updated".to_string(),
         };
-        let changed = PlayerV1::upsert(&updated, conn).unwrap();
+        let changed = updated.upsert(conn).unwrap();
         assert!(changed, "upsert of existing row should return true");
 
         // Read it back and verify update took effect
@@ -304,7 +304,7 @@ mod test {
     where
         AutoIncrementModel: Crud<B>,
     {
-        <AutoIncrementModel as Crud<B>>::create(conn).unwrap();
+        AutoIncrementModel::create(conn).unwrap();
 
         // Verify that the id field has auto_increment enabled
         let crud_fields = <AutoIncrementModel as HasCrudFields>::crud_fields();
@@ -322,23 +322,23 @@ mod test {
         );
 
         // Insert three records with auto_increment and verify sequential IDs
-        let record1 = AutoIncrementModel {
+        let mut record1 = AutoIncrementModel {
             id: AutoPrimaryKey::default(),
             name: "first".to_string(),
         };
-        <AutoIncrementModel as Crud<B>>::insert(&record1, conn).unwrap();
+        record1.insert(conn).unwrap();
 
-        let record2 = AutoIncrementModel {
+        let mut record2 = AutoIncrementModel {
             id: AutoPrimaryKey::default(),
             name: "second".to_string(),
         };
-        <AutoIncrementModel as Crud<B>>::insert(&record2, conn).unwrap();
+        record2.insert(conn).unwrap();
 
-        let record3 = AutoIncrementModel {
+        let mut record3 = AutoIncrementModel {
             id: AutoPrimaryKey::default(),
             name: "third".to_string(),
         };
-        <AutoIncrementModel as Crud<B>>::insert(&record3, conn).unwrap();
+        record3.insert(conn).unwrap();
 
         // Verify all records were created with sequential IDs
         let from_db_1 = <AutoIncrementModel as Crud<B>>::read(conn, 1)
@@ -388,23 +388,23 @@ mod test {
         );
 
         // Insert three records with auto_increment and verify sequential IDs
-        let record1 = AutoIncrementModelI32 {
+        let mut record1 = AutoIncrementModelI32 {
             id: AutoPrimaryKey::default(),
             name: "first i32".to_string(),
         };
-        <AutoIncrementModelI32 as Crud<B>>::insert(&record1, conn).unwrap();
+        record1.insert(conn).unwrap();
 
-        let record2 = AutoIncrementModelI32 {
+        let mut record2 = AutoIncrementModelI32 {
             id: AutoPrimaryKey::default(),
             name: "second i32".to_string(),
         };
-        <AutoIncrementModelI32 as Crud<B>>::insert(&record2, conn).unwrap();
+        record2.insert(conn).unwrap();
 
-        let record3 = AutoIncrementModelI32 {
+        let mut record3 = AutoIncrementModelI32 {
             id: AutoPrimaryKey::default(),
             name: "third i32".to_string(),
         };
-        <AutoIncrementModelI32 as Crud<B>>::insert(&record3, conn).unwrap();
+        record3.insert(conn).unwrap();
 
         // Verify all records were created with sequential IDs
         let from_db_1 = <AutoIncrementModelI32 as Crud<B>>::read(conn, 1)
@@ -436,7 +436,7 @@ mod test {
     where
         AutoIncrementModelU32: Crud<B>,
     {
-        <AutoIncrementModelU32 as Crud<B>>::create(conn).unwrap();
+        AutoIncrementModelU32::create(conn).unwrap();
 
         // Verify that the id field has auto_increment enabled (u32 variant)
         let crud_fields = <AutoIncrementModelU32 as HasCrudFields>::crud_fields();
@@ -454,23 +454,23 @@ mod test {
         );
 
         // Insert three records with auto_increment and verify sequential IDs
-        let record1 = AutoIncrementModelU32 {
+        let mut record1 = AutoIncrementModelU32 {
             id: AutoPrimaryKey::default(),
             name: "first u32".to_string(),
         };
-        <AutoIncrementModelU32 as Crud<B>>::insert(&record1, conn).unwrap();
+        record1.insert(conn).unwrap();
 
-        let record2 = AutoIncrementModelU32 {
+        let mut record2 = AutoIncrementModelU32 {
             id: AutoPrimaryKey::default(),
             name: "second u32".to_string(),
         };
-        <AutoIncrementModelU32 as Crud<B>>::insert(&record2, conn).unwrap();
+        record2.insert(conn).unwrap();
 
-        let record3 = AutoIncrementModelU32 {
+        let mut record3 = AutoIncrementModelU32 {
             id: AutoPrimaryKey::default(),
             name: "third u32".to_string(),
         };
-        <AutoIncrementModelU32 as Crud<B>>::insert(&record3, conn).unwrap();
+        record3.insert(conn).unwrap();
 
         // Verify all records were created with sequential IDs
         let from_db_1 = <AutoIncrementModelU32 as Crud<B>>::read(conn, 1)
@@ -498,14 +498,90 @@ mod test {
         assert_eq!(from_db_3.id.inner, Some(3));
     }
 
+    fn test_auto_increment_key_update<B: CrudBackend>(conn: B::Connection<'_>)
+    where
+        AutoIncrementModel: Crud<B>,
+    {
+        AutoIncrementModel::create(conn).unwrap();
+
+        // Test that insert() updates the AutoPrimaryKey value
+        let mut record1 = AutoIncrementModel {
+            id: AutoPrimaryKey::default(),
+            name: "first".to_string(),
+        };
+        // Before insert, the id should be None
+        assert_eq!(record1.id.inner, None, "id should be None before insert");
+
+        record1.insert(conn).unwrap();
+
+        // After insert, the id should be updated to Some(1)
+        assert_eq!(
+            record1.id.inner,
+            Some(1),
+            "id should be updated to Some(1) after insert"
+        );
+
+        // Insert another record to verify sequential incrementing
+        let mut record2 = AutoIncrementModel {
+            id: AutoPrimaryKey::default(),
+            name: "second".to_string(),
+        };
+        assert_eq!(record2.id.inner, None, "id should be None before insert");
+
+        record2.insert(conn).unwrap();
+
+        assert_eq!(
+            record2.id.inner,
+            Some(2),
+            "id should be updated to Some(2) after insert"
+        );
+
+        // Test that upsert() also updates the AutoPrimaryKey value
+        let mut record3 = AutoIncrementModel {
+            id: AutoPrimaryKey::default(),
+            name: "third".to_string(),
+        };
+        assert_eq!(record3.id.inner, None, "id should be None before upsert");
+
+        let changed = record3.upsert(conn).unwrap();
+        assert!(changed, "upsert should return true for new record");
+
+        assert_eq!(
+            record3.id.inner,
+            Some(3),
+            "id should be updated to Some(3) after upsert"
+        );
+
+        // Verify upsert with existing key (should update, not create new)
+        record3.name = "third updated".to_string();
+        let changed = record3.upsert(conn).unwrap();
+        assert!(changed, "upsert should return true for updated record");
+
+        // ID should remain the same
+        assert_eq!(
+            record3.id.inner,
+            Some(3),
+            "id should remain Some(3) after upsert of existing record"
+        );
+
+        // Verify from database that the name was updated
+        let from_db = <AutoIncrementModel as Crud<B>>::read(conn, 3)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db.name, "third updated");
+        assert_eq!(from_db.id.inner, Some(3));
+    }
+
     fn test_json_text<B: CrudBackend>(conn: B::Connection<'_>)
     where
         Palette: Crud<B>,
     {
-        <Palette as Crud<B>>::create(conn).unwrap();
+        Palette::create(conn).unwrap();
 
         // Insert a palette with colors and Some metadata
-        let palette = Palette {
+        let mut palette = Palette {
             id: PrimaryKey::new(1),
             colors: JsonText::new(vec![
                 Color {
@@ -519,7 +595,7 @@ mod test {
             ]),
             metadata: Some(JsonText::new(vec!["warm".into(), "nature".into()])),
         };
-        <Palette as Crud<B>>::insert(&palette, conn).unwrap();
+        palette.insert(conn).unwrap();
 
         // Read it back and verify round-trip
         let from_db = <Palette as Crud<B>>::read(conn, 1)
@@ -530,7 +606,7 @@ mod test {
         assert_eq!(palette, from_db);
 
         // Insert a palette with None metadata
-        let palette_no_meta = Palette {
+        let mut palette_no_meta = Palette {
             id: PrimaryKey::new(2),
             colors: JsonText::new(vec![Color {
                 name: "blue".into(),
@@ -538,7 +614,7 @@ mod test {
             }]),
             metadata: None,
         };
-        <Palette as Crud<B>>::insert(&palette_no_meta, conn).unwrap();
+        palette_no_meta.insert(conn).unwrap();
 
         let from_db = <Palette as Crud<B>>::read(conn, 2)
             .unwrap()
@@ -548,7 +624,7 @@ mod test {
         assert_eq!(palette_no_meta, from_db);
 
         // Upsert the first palette with updated colors
-        let updated = Palette {
+        let mut updated = Palette {
             id: PrimaryKey::new(1),
             colors: JsonText::new(vec![Color {
                 name: "purple".into(),
@@ -556,7 +632,7 @@ mod test {
             }]),
             metadata: None,
         };
-        <Palette as Crud<B>>::upsert(&updated, conn).unwrap();
+        updated.upsert(conn).unwrap();
 
         let from_db = <Palette as Crud<B>>::read(conn, 1)
             .unwrap()
@@ -583,7 +659,7 @@ mod test {
             name: "tymigrawr".to_string(),
             age: 0.1,
         };
-        <PlayerV2 as Crud<B>>::insert(&first_player, conn).unwrap();
+        first_player.insert(conn).unwrap();
         let mut p1 = <PlayerV2 as Crud<B>>::read(conn, first_player.id.inner).unwrap();
         assert_eq!(first_player, p1.next().unwrap().unwrap());
 
@@ -619,14 +695,14 @@ mod test {
         <PlayerV3 as Crud<B>>::create((mk_connection)("playerv3")).unwrap();
 
         log::debug!("populating v1");
-        let players_v1 = (0..100)
+        let mut players_v1 = (0..100)
             .map(|i| PlayerV1 {
                 id: PrimaryKey::new(i),
                 name: format!("tymigrawr_{i}"),
             })
             .collect::<Vec<_>>();
-        for player in players_v1.iter() {
-            <PlayerV1 as Crud<B>>::insert(player, (mk_connection)("playerv1")).unwrap();
+        for player in players_v1.iter_mut() {
+            player.insert((mk_connection)("playerv1")).unwrap();
         }
         let players_v3 = players_v1
             .iter()
@@ -692,15 +768,15 @@ mod test {
                 // Create the source table for test data insertion
                 <PlayerV1 as Crud<B>>::create(conn).unwrap();
 
-                let players_v1 = (0..test_data_count)
+                let mut players_v1 = (0..test_data_count)
                     .map(|i| PlayerV1 {
                         id: PrimaryKey::new(i),
                         name: format!("player_v1_{i}"),
                     })
                     .collect::<Vec<_>>();
 
-                for player in players_v1.iter() {
-                    <PlayerV1 as Crud<B>>::insert(player, conn).unwrap();
+                for player in players_v1.iter_mut() {
+                    player.insert(conn).unwrap();
                 }
 
                 // Expected final data in V4
@@ -748,7 +824,7 @@ mod test {
                 // Create the source table for test data insertion
                 <PlayerV2 as Crud<B>>::create(conn).unwrap();
 
-                let players_v2 = (0..test_data_count)
+                let mut players_v2 = (0..test_data_count)
                     .map(|i| PlayerV2 {
                         id: PrimaryKey::new(i),
                         name: format!("player_v2_{i}"),
@@ -756,8 +832,8 @@ mod test {
                     })
                     .collect::<Vec<_>>();
 
-                for player in players_v2.iter() {
-                    <PlayerV2 as Crud<B>>::insert(player, conn).unwrap();
+                for player in players_v2.iter_mut() {
+                    player.insert(conn).unwrap();
                 }
 
                 // Expected final data in V4
@@ -804,7 +880,7 @@ mod test {
                 // Create the source table for test data insertion
                 <PlayerV3 as Crud<B>>::create(conn).unwrap();
 
-                let players_v3 = (0..test_data_count)
+                let mut players_v3 = (0..test_data_count)
                     .map(|i| PlayerV3 {
                         id: PrimaryKey::new(i),
                         name: format!("player_v3_{i}"),
@@ -812,8 +888,8 @@ mod test {
                     })
                     .collect::<Vec<_>>();
 
-                for player in players_v3.iter() {
-                    <PlayerV3 as Crud<B>>::insert(player, conn).unwrap();
+                for player in players_v3.iter_mut() {
+                    player.insert(conn).unwrap();
                 }
 
                 // Expected final data in V4
@@ -859,7 +935,7 @@ mod test {
                 // Create the source table for test data insertion
                 <PlayerV4 as Crud<B>>::create(conn).unwrap();
 
-                let players_v4 = (0..test_data_count)
+                let mut players_v4 = (0..test_data_count)
                     .map(|i| PlayerV4 {
                         id: PrimaryKey::new(i),
                         name: format!("player_v4_{i}"),
@@ -868,8 +944,8 @@ mod test {
                     })
                     .collect::<Vec<_>>();
 
-                for player in players_v4.iter() {
-                    PlayerV4::insert(player, conn).unwrap();
+                for player in players_v4.iter_mut() {
+                    player.insert(conn).unwrap();
                 }
 
                 // Run migration chain V1 -> V4
@@ -898,14 +974,14 @@ mod test {
                 <PlayerV1 as Crud<B>>::create(conn).unwrap();
                 <PlayerV3 as Crud<B>>::create(conn).unwrap();
 
-                let players_v1 = (0..5)
+                let mut players_v1 = (0..5)
                     .map(|i| PlayerV1 {
                         id: PrimaryKey::new(i),
                         name: format!("player_v1_{i}"),
                     })
                     .collect::<Vec<_>>();
 
-                let players_v3 = (5..10)
+                let mut players_v3 = (5..10)
                     .map(|i| PlayerV3 {
                         id: PrimaryKey::new(i),
                         name: format!("player_v3_{i}"),
@@ -913,11 +989,11 @@ mod test {
                     })
                     .collect::<Vec<_>>();
 
-                for player in players_v1.iter() {
-                    <PlayerV1 as Crud<B>>::insert(player, conn).unwrap();
+                for player in players_v1.iter_mut() {
+                    player.insert(conn).unwrap();
                 }
-                for player in players_v3.iter() {
-                    <PlayerV3 as Crud<B>>::insert(player, conn).unwrap();
+                for player in players_v3.iter_mut() {
+                    player.insert(conn).unwrap();
                 }
 
                 // Expected final data in V4 (both sources converted)
@@ -986,7 +1062,7 @@ mod test {
                 // Create the source table for test data insertion
                 <PlayerV4 as Crud<B>>::create(conn).unwrap();
 
-                let players_v4 = (0..test_data_count)
+                let mut players_v4 = (0..test_data_count)
                     .map(|i| PlayerV4 {
                         id: PrimaryKey::new(i),
                         name: format!("player_v4_{i}"),
@@ -995,8 +1071,8 @@ mod test {
                     })
                     .collect::<Vec<_>>();
 
-                for player in players_v4.iter() {
-                    <PlayerV4 as Crud<B>>::insert(player, conn).unwrap();
+                for player in players_v4.iter_mut() {
+                    player.insert(conn).unwrap();
                 }
 
                 // Expected final data in V1 (reverse converted)
@@ -1046,8 +1122,15 @@ mod test {
 
     #[cfg(feature = "backend_sqlite")]
     mod sqlite_tests {
-        use super::*;
-        use crate::Sqlite;
+        use super::{test_p1_crud, SettingsV1};
+        use crate::{
+            test::{
+                test_auto_increment_i32, test_auto_increment_i64, test_auto_increment_key_update,
+                test_auto_increment_u32, test_json_text, test_migrate, test_migrate_4_versions,
+                test_p2_crud, test_upsert,
+            },
+            Crud, PrimaryKey, Sqlite,
+        };
 
         #[test]
         fn p1_crud() {
@@ -1079,13 +1162,13 @@ mod test {
             <SettingsV1 as Crud<Sqlite>>::create(&conn).unwrap();
 
             // Insert a row with NULL Option fields
-            let settings = SettingsV1 {
+            let mut settings = SettingsV1 {
                 id: PrimaryKey::new(1),
                 api_key: None,
                 token: None,
                 timeout_secs: 60,
             };
-            <SettingsV1 as Crud<Sqlite>>::insert(&settings, &conn).unwrap();
+            <SettingsV1 as Crud<Sqlite>>::insert(&mut settings, &conn).unwrap();
 
             // Now try to read it back using try_from_row
             let mut stmt = conn
@@ -1096,13 +1179,13 @@ mod test {
             assert_eq!(settings, loaded);
 
             // Insert another row with Some values
-            let settings2 = SettingsV1 {
+            let mut settings2 = SettingsV1 {
                 id: PrimaryKey::new(2),
                 api_key: Some("secret-key".to_string()),
                 token: Some("auth-token".to_string()),
                 timeout_secs: 120,
             };
-            <SettingsV1 as Crud<Sqlite>>::insert(&settings2, &conn).unwrap();
+            <SettingsV1 as Crud<Sqlite>>::insert(&mut settings2, &conn).unwrap();
 
             let mut stmt = conn
                 .prepare("SELECT * FROM settingsv1 WHERE id = 2")
@@ -1112,13 +1195,13 @@ mod test {
             assert_eq!(settings2, loaded);
 
             // Insert row with mixed Some/None
-            let settings3 = SettingsV1 {
+            let mut settings3 = SettingsV1 {
                 id: PrimaryKey::new(3),
                 api_key: Some("key-only".to_string()),
                 token: None,
                 timeout_secs: 90,
             };
-            <SettingsV1 as Crud<Sqlite>>::insert(&settings3, &conn).unwrap();
+            <SettingsV1 as Crud<Sqlite>>::insert(&mut settings3, &conn).unwrap();
 
             let mut stmt = conn
                 .prepare("SELECT * FROM settingsv1 WHERE id = 3")
@@ -1144,6 +1227,12 @@ mod test {
         fn auto_increment_u32() {
             let conn = sqlite::open(":memory:").unwrap();
             test_auto_increment_u32::<Sqlite>(&conn);
+        }
+
+        #[test]
+        fn auto_increment_key_update() {
+            let conn = sqlite::open(":memory:").unwrap();
+            test_auto_increment_key_update::<Sqlite>(&conn);
         }
 
         #[test]
@@ -1290,7 +1379,7 @@ mod test {
             User::create(conn)?;
 
             // Insert
-            let user = User {
+            let mut user = User {
                 id: PrimaryKey::new(1),
                 name: "Alice".to_string(),
             };

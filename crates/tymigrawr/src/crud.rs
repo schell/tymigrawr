@@ -63,7 +63,7 @@ type ReadResult<'a, T, Backend> = Result<
 ///     // Create table
 ///     User::create(conn)?;
 ///     // Insert
-///     let user = User {
+///     let mut user = User {
 ///         id: PrimaryKey::new(1),
 ///         name: "Alice".to_string(),
 ///     };
@@ -93,17 +93,24 @@ where
 
     /// Inserts a single row into the table.
     ///
-    /// Fails if a row with the same primary key already exists.
+    /// Takes `self` mutably because it updates the primary key in the case of auto incrementing primary
+    /// keys.
+    ///
+    /// ## Errors
+    /// Errors if a row with the same primary key already exists.
     fn insert(
-        &self,
+        &mut self,
         connection: Backend::Connection<'_>,
     ) -> std::result::Result<(), Error<Backend::Error>>;
 
     /// Inserts a row, or updates all non-primary-key columns if a row with the same primary key exists.
     ///
+    /// Takes `self` mutably because it updates the primary key in the case of insertinga record with
+    /// auto incrementing primary keys.
+    ///
     /// Returns `true` if the row was inserted or updated, `false` if no change was needed.
     fn upsert(
-        &self,
+        &mut self,
         connection: Backend::Connection<'_>,
     ) -> std::result::Result<bool, Error<Backend::Error>>;
 
