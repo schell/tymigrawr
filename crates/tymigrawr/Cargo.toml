@@ -8,11 +8,14 @@ edition = "2021"
 [features]
 default = ["backend_sqlite"]
 backend_sqlite = ["sqlite"]
-backend_toml = ["dep:toml", "dep:base64"]
+backend_toml = ["dep:toml"]
+backend_doltlite = ["rusqdoltlite"]
+backend_indexeddb = ["dep:rexie", "dep:web-sys", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:serde-wasm-bindgen"]
 schemars = ["dep:schemars"]
 
 [dependencies]
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
+rusqdoltlite = { version = "0.40", optional = true }
 log = "0.4"
 schemars = { version = "1.2.1", optional = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -22,6 +25,14 @@ sqlite = { version = "0.37", optional = true }
 toml = { version = "0.8", optional = true }
 tymigrawr-derive = { version = "0.1.0", path = "../tymigrawr-derive" }
 
-[dev-dependencies]
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rexie = { version = "0.6", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["Window"] }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 env_logger = "0.10"
 tempfile = "3.8"

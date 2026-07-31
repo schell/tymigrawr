@@ -75,10 +75,26 @@ pub use error::Error;
 pub use migrations::*;
 pub use tymigrawr_derive::HasCrudFields;
 
+#[cfg(all(feature = "backend_sqlite", feature = "backend_doltlite"))]
+compile_error!(
+    "the `backend_sqlite` and `backend_doltlite` features are mutually exclusive: \
+     they link two incompatible SQLite-compatible C libraries (sqlite3-sys and \
+     libdoltlite-sys) into the same binary, causing native-symbol collisions that \
+     hang the migration tests; enable at most one at a time"
+);
+
 #[cfg(feature = "backend_sqlite")]
 mod backend_sqlite;
 #[cfg(feature = "backend_sqlite")]
 pub use backend_sqlite::*;
+#[cfg(feature = "backend_doltlite")]
+mod backend_doltlite;
+#[cfg(feature = "backend_doltlite")]
+pub use backend_doltlite::*;
+#[cfg(all(feature = "backend_indexeddb", target_arch = "wasm32"))]
+mod backend_indexeddb;
+#[cfg(all(feature = "backend_indexeddb", target_arch = "wasm32"))]
+pub use backend_indexeddb::*;
 
 #[cfg(feature = "backend_toml")]
 mod backend_toml;
@@ -197,6 +213,7 @@ mod test {
         pub metadata: Option<JsonText<Vec<String>>>,
     }
 
+    #[cfg(feature = "backend_sqlite")]
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct SettingsV1 {
         pub id: PrimaryKey<i64>,
@@ -1285,6 +1302,113 @@ mod test {
         }
     }
 
+    #[cfg(feature = "backend_doltlite")]
+    mod doltlite_tests {
+        use super::*;
+        use crate::Doltlite;
+
+        fn open_in_memory() -> rusqlite::Connection {
+            rusqlite::Connection::open_in_memory().unwrap()
+        }
+
+        #[test]
+        fn p1_crud() {
+            let conn = open_in_memory();
+            test_p1_crud::<Doltlite>(&conn);
+        }
+
+        #[test]
+        fn p2_crud() {
+            let conn = open_in_memory();
+            test_p2_crud::<Doltlite>(&conn);
+        }
+
+        #[test]
+        fn upsert() {
+            let conn = open_in_memory();
+            test_upsert::<Doltlite>(&conn);
+        }
+
+        #[test]
+        fn json_text() {
+            let conn = open_in_memory();
+            test_json_text::<Doltlite>(&conn);
+        }
+
+        #[test]
+        fn auto_increment_i64() {
+            let conn = open_in_memory();
+            test_auto_increment_i64::<Doltlite>(&conn);
+        }
+
+        #[test]
+        fn auto_increment_i32() {
+            let conn = open_in_memory();
+            test_auto_increment_i32::<Doltlite>(&conn);
+        }
+
+        #[test]
+        fn auto_increment_u32() {
+            let conn = open_in_memory();
+            test_auto_increment_u32::<Doltlite>(&conn);
+        }
+
+        #[test]
+        fn auto_increment_key_update() {
+            let conn = open_in_memory();
+            test_auto_increment_key_update::<Doltlite>(&conn);
+        }
+
+        #[test]
+        fn migrate() {
+            let tempdir = tempfile::tempdir().unwrap();
+            let path = tempdir.path().join("data.db");
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let path = tempdir.path().join("data_v3.db");
+            let connection_v3 = rusqlite::Connection::open(&path).unwrap();
+            test_migrate::<Doltlite>(|table| match table {
+                "playerv3" => &connection_v3,
+                _ => &connection,
+            });
+        }
+
+        #[test]
+        fn migrate_4_versions_v1_only() {
+            let conn = open_in_memory();
+            test_migrate_4_versions::<Doltlite>("v1_only", &conn);
+        }
+
+        #[test]
+        fn migrate_4_versions_v2_only() {
+            let conn = open_in_memory();
+            test_migrate_4_versions::<Doltlite>("v2_only", &conn);
+        }
+
+        #[test]
+        fn migrate_4_versions_v3_only() {
+            let conn = open_in_memory();
+            test_migrate_4_versions::<Doltlite>("v3_only", &conn);
+        }
+
+        #[test]
+        fn migrate_4_versions_v4_only() {
+            let conn = open_in_memory();
+            test_migrate_4_versions::<Doltlite>("v4_only", &conn);
+        }
+
+        #[test]
+        fn migrate_4_versions_v1_v3_mix() {
+            let conn = open_in_memory();
+            test_migrate_4_versions::<Doltlite>("v1_v3_mix", &conn);
+        }
+
+        #[test]
+        fn migrate_4_versions_reverse() {
+            let conn = open_in_memory();
+            test_migrate_4_versions::<Doltlite>("reverse", &conn);
+        }
+    }
+
     #[cfg(feature = "backend_toml")]
     mod toml_tests {
         use super::*;
@@ -1357,6 +1481,7 @@ mod test {
         }
     }
 
+    #[cfg(feature = "backend_sqlite")]
     #[test]
     fn module_docs() {
         use crate::{Crud, HasCrudFields, PrimaryKey, Sqlite};

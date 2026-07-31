@@ -34,18 +34,37 @@ cargo clippy -p tymigrawr-derive   # lint derive crate only
 
 ### Test
 
+The `backend_sqlite` and `backend_doltlite` features are mutually exclusive
+(see the `compile_error!` guard in `crates/tymigrawr/src/lib.rs`): each links a
+different SQLite-compatible C library (`sqlite3-sys` vs `libdoltlite-sys`), and
+linking both into one binary causes native-symbol collisions that hang the
+migration tests. Run each backend's tests in a separate `cargo test`
+invocation. The default feature set is `backend_sqlite` only.
+
 ```sh
-cargo test --workspace                         # run all tests
-cargo test -p tymigrawr                        # run tests in core crate only
-cargo test -p tymigrawr -- p1_crud             # run a single test by name
-cargo test -p tymigrawr -- migrate             # run the migration test
-RUST_LOG=trace cargo test -p tymigrawr -- --nocapture   # run with log output visible
+# Default (backend_sqlite only)
+cargo test -p tymigrawr
+cargo test -p tymigrawr-derive
+
+# Doltlite backend only
+cargo test -p tymigrawr --no-default-features --features backend_doltlite
+
+# TOML backend only (can combine with sqlite safely, but not with doltlite)
+cargo test -p tymigrawr --no-default-features --features backend_toml
+cargo test -p tymigrawr --no-default-features --features backend_sqlite,backend_toml
+
+# Single test by name (still respects feature selection)
+cargo test -p tymigrawr -- p1_crud
+cargo test -p tymigrawr --no-default-features --features backend_doltlite -- migrate
+RUST_LOG=trace cargo test -p tymigrawr -- --nocapture   # visible log output
 ```
 
 All tests live in a `#[cfg(test)] mod test` block at the bottom of
-`crates/tymigrawr/src/lib.rs`. There are no integration tests or tests in the derive
-crate. Tests use in-memory SQLite (`sqlite::open(":memory:")`) and `tempfile` for
-on-disk databases.
+`crates/tymigrawr/src/lib.rs`, split into `sqlite_tests`, `doltlite_tests`,
+and `toml_tests` submodules gated on their respective features. There are no
+integration tests or tests in the derive crate. Tests use in-memory SQLite
+(`sqlite::open(":memory:")` / `rusqlite::Connection::open_in_memory()`) and
+`tempfile` for on-disk databases.
 
 ## Architecture
 
