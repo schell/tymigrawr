@@ -7,11 +7,13 @@
 //! Byte values are stored as base64-encoded strings.
 use std::{
     collections::HashMap,
-    fs,
     path::{Path, PathBuf},
+    pin::Pin,
 };
 
+use async_stream::try_stream;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use futures::{Stream, StreamExt};
 use snafu::prelude::*;
 
 use crate::{
@@ -64,11 +66,11 @@ fn toml_to_value(tv: &toml::Value, vt: &ValueType) -> Option<Value> {
 /// Read all rows from a table's TOML file.
 ///
 /// Returns an empty vec if the file does not exist.
-fn read_rows(path: &Path) -> TymResult<Vec<toml::value::Table>, TomlError> {
+async fn read_rows(path: &Path) -> TymResult<Vec<toml::value::Table>, TomlError> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = fs::read_to_string(path).context(IoSnafu)?;
+    let content = tokio::fs::read_to_string(path).await.context(IoSnafu)?;
     if content.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -86,7 +88,7 @@ fn read_rows(path: &Path) -> TymResult<Vec<toml::value::Table>, TomlError> {
 }
 
 /// Write rows to a table's TOML file as `[[row]]` entries.
-fn write_rows(path: &Path, rows: &[toml::value::Table]) -> Result<(), TomlError> {
+async fn write_rows(path: &Path, rows: &[toml::value::Table]) -> Result<(), TomlError> {
     let mut doc = toml::value::Table::new();
     let arr = rows
         .iter()
@@ -94,7 +96,7 @@ fn write_rows(path: &Path, rows: &[toml::value::Table]) -> Result<(), TomlError>
         .collect::<Vec<_>>();
     doc.insert("row".to_string(), toml::Value::Array(arr));
     let content = toml::to_string_pretty(&doc).context(SerializationSnafu)?;
-    fs::write(path, content).context(IoSnafu)?;
+    tokio::fs::write(path, content).await.context(IoSnafu)?;
     Ok(())
 }
 
@@ -109,7 +111,7 @@ fn fields_to_row(fields: &HashMap<&str, Value>) -> toml::value::Table {
 
 /// Convert a TOML row table back into a `HashMap<&str, Value>`, using the
 /// field metadata to properly decode bytes vs strings.
-fn row_to_fields<'a>(row: &toml::value::Table, fields: &[CrudField]) -> HashMap<&'a str, Value> {
+fn row_to_fields(row: &toml::value::Table, fields: &[CrudField]) -> HashMap<&'static str, Value> {
     let mut map = HashMap::new();
     for field in fields.iter() {
         let value = match row.get(field.name) {
@@ -193,7 +195,7 @@ impl From<std::io::Error> for TomlError {
 impl From<TomlError> for crate::Error<TomlError> {
     fn from(inner: TomlError) -> Self {
         crate::Error::Backend {
-            source: crate::error::DomainError { inner },
+            source: DomainError { inner },
         }
     }
 }
@@ -204,7 +206,7 @@ impl CrudBackend for Toml {
 }
 
 impl MigrateEntireTable for Toml {
-    fn read_all_values<'a>(
+    async fn read_all_values<'a>(
         connection: &'a Path,
         table_name: &'a str,
         fields: Vec<CrudField>,
@@ -216,7 +218,7 @@ impl MigrateEntireTable for Toml {
             log::debug!("Table {table_name} does not exist, no rows to migrate");
         }
 
-        let rows = read_rows(&path)?;
+        let rows = read_rows(&path).await?;
         let result = rows
             .into_iter()
             .map(|row| {
@@ -227,22 +229,22 @@ impl MigrateEntireTable for Toml {
         Ok(result)
     }
 
-    fn insert_fields(
+    async fn insert_fields<'a>(
         connection: &Path,
         table_name: &str,
         fields: &HashMap<&str, Value>,
     ) -> TymResult<(), TomlError> {
         let path = table_path(connection, table_name);
-        let mut rows = read_rows(&path)?;
+        let mut rows = read_rows(&path).await?;
         rows.push(fields_to_row(fields));
-        write_rows(&path, &rows)?;
+        write_rows(&path, &rows).await?;
         Ok(())
     }
 
-    fn delete_all(connection: &Path, table_name: &str) -> TymResult<(), TomlError> {
+    async fn delete_all<'a>(connection: &Path, table_name: &str) -> TymResult<(), TomlError> {
         let path = table_path(connection, table_name);
         if path.exists() {
-            write_rows(&path, &[])?;
+            write_rows(&path, &[]).await?;
         }
         Ok(())
     }
@@ -251,22 +253,24 @@ impl MigrateEntireTable for Toml {
 impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
     /// Create the data directory (if needed) and an empty table file if it
     /// does not already exist.
-    fn create(connection: &Path) -> TymResult<(), TomlError> {
-        fs::create_dir_all(connection).context(IoSnafu)?;
+    async fn create<'a>(connection: &Path) -> TymResult<(), TomlError> {
+        tokio::fs::create_dir_all(connection)
+            .await
+            .context(IoSnafu)?;
         let path = table_path(connection, Self::table_name());
         if !path.exists() {
-            write_rows(&path, &[])?;
+            write_rows(&path, &[]).await?;
         }
         Ok(())
     }
 
-    fn insert(&mut self, connection: &Path) -> TymResult<(), TomlError> {
+    async fn insert<'a>(&mut self, connection: &Path) -> TymResult<(), TomlError> {
         let table_name = Self::table_name();
         let fields = self.as_crud_fields();
-        Toml::insert_fields(connection, table_name, &fields)
+        Toml::insert_fields(connection, table_name, &fields).await
     }
 
-    fn upsert(&mut self, connection: &Path) -> TymResult<bool, TomlError> {
+    async fn upsert<'a>(&mut self, connection: &Path) -> TymResult<bool, TomlError> {
         let table_name = Self::table_name();
         let path = table_path(connection, table_name);
         let crud_fields = Self::crud_fields();
@@ -276,7 +280,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
             context: "missing primary key value for upsert".to_string(),
         })?;
 
-        let mut rows = read_rows(&path)?;
+        let mut rows = read_rows(&path).await?;
         let pk_field =
             crud_fields
                 .iter()
@@ -305,64 +309,63 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
             rows.push(fields_to_row(&new_fields));
         }
 
-        write_rows(&path, &rows)?;
+        write_rows(&path, &rows).await?;
         Ok(true)
     }
 
-    fn read_all<'a>(
+    async fn read_all<'a>(
         connection: <Toml as CrudBackend>::Connection<'a>,
-    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, TomlError>> + 'a>, TomlError> {
+    ) -> TymResult<Pin<Box<dyn Stream<Item = Result<Self, Error<TomlError>>> + 'a>>, TomlError>
+    {
         let table_name = Self::table_name();
-        let cursor = Toml::read_all_values(connection, table_name, Self::crud_fields())?;
-        Ok(Box::new(cursor.into_iter().map(|cols| {
-            Self::try_from_crud_fields(&cols?).map_err(|_| Error::Backend {
-                source: DomainError {
-                    inner: TomlError::RowNotFound {
-                        context: "failed to deserialize row".to_string(),
-                    },
-                },
-            })
-        })))
+        let path = table_path(connection, table_name);
+        let fields = Self::crud_fields();
+        let rows = read_rows(&path).await?;
+        let stream = try_stream! {
+            for row in rows {
+                let cols = row_to_fields(&row, &fields);
+                yield Self::try_from_crud_fields(&cols)?;
+            }
+        };
+        Ok(Box::pin(stream))
     }
 
-    fn read_where<'a>(
+    async fn read_where<'a, Key: IsCrudField + 'a>(
         connection: &'a Path,
         key_name: &'a str,
         comparison: &'a str,
-        key_value: impl IsCrudField,
-    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, TomlError>> + 'a>, TomlError> {
+        key_value: Key,
+    ) -> TymResult<Pin<Box<dyn Stream<Item = Result<Self, Error<TomlError>>> + 'a>>, TomlError>
+    {
         let rhs = key_value.value();
-        let cursor = Toml::read_all_values(connection, Self::table_name(), Self::crud_fields())?;
-        let iter = cursor.into_iter().filter_map(move |cols| match cols {
-            Ok(ref map) => {
-                let lhs = map.get(key_name)?;
-                match compare_values(lhs, comparison, &rhs) {
-                    Ok(true) => Some(Self::try_from_crud_fields(map).map_err(|_| Error::Backend {
-                        source: DomainError {
-                            inner: TomlError::RowNotFound {
-                                context: "failed to deserialize row".to_string(),
-                            },
-                        },
-                    })),
-                    Ok(false) => None,
-                    Err(e) => Some(Err(Error::Backend {
-                        source: DomainError { inner: e },
-                    })),
+        let path = table_path(connection, Self::table_name());
+        let fields = Self::crud_fields();
+        let rows = read_rows(&path).await?;
+        let stream = try_stream! {
+            for row in rows {
+                let cols = row_to_fields(&row, &fields);
+                let lhs = cols.get(key_name);
+                let keep = match lhs {
+                    Some(v) => compare_values(v, comparison, &rhs)?,
+                    None => false,
+                };
+                if keep {
+                    yield Self::try_from_crud_fields(&cols)?;
                 }
             }
-            Err(e) => Some(Err(e)),
-        });
-        Ok(Box::new(iter))
+        };
+        Ok(Box::pin(stream))
     }
 
-    fn read<'a, Key: IsCrudField>(
+    async fn read<'a, Key: IsCrudField + 'a>(
         connection: <Toml as CrudBackend>::Connection<'a>,
         key: Key,
-    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, TomlError>> + 'a>, TomlError> {
-        <Self as Crud<Toml>>::read_where(connection, Self::primary_key_name(), "=", key)
+    ) -> TymResult<Pin<Box<dyn Stream<Item = Result<Self, Error<TomlError>>> + 'a>>, TomlError>
+    {
+        <Self as Crud<Toml>>::read_where(connection, Self::primary_key_name(), "=", key).await
     }
 
-    fn update(&self, connection: &Path) -> TymResult<(), TomlError> {
+    async fn update<'a>(&self, connection: &Path) -> TymResult<(), TomlError> {
         let table_name = Self::table_name();
         let path = table_path(connection, table_name);
         let crud_fields = Self::crud_fields();
@@ -372,7 +375,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
             context: "missing primary key value for update".to_string(),
         })?;
 
-        let mut rows = read_rows(&path)?;
+        let mut rows = read_rows(&path).await?;
         let mut found = false;
         for row in rows.iter_mut() {
             let row_pk = row.get(pk_name);
@@ -400,11 +403,11 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
                 context: "no row with matching primary key to update".to_string()
             }
         );
-        write_rows(&path, &rows)?;
+        write_rows(&path, &rows).await?;
         Ok(())
     }
 
-    fn delete(self, connection: &Path) -> TymResult<(), TomlError> {
+    async fn delete<'a>(self, connection: &Path) -> TymResult<(), TomlError> {
         let table_name = Self::table_name();
         let path = table_path(connection, table_name);
         let crud_fields = Self::crud_fields();
@@ -414,7 +417,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
             context: "missing primary key value for delete".to_string(),
         })?;
 
-        let rows = read_rows(&path)?;
+        let rows = read_rows(&path).await?;
         let pk_field =
             crud_fields
                 .iter()
@@ -432,7 +435,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Toml> for T {
                 None => true,
             })
             .collect();
-        write_rows(&path, &remaining)?;
+        write_rows(&path, &remaining).await?;
         Ok(())
     }
 

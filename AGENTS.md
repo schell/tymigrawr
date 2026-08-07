@@ -36,17 +36,23 @@ cargo clippy -p tymigrawr-derive   # lint derive crate only
 
 The `backend_sqlite` and `backend_doltlite` features are mutually exclusive
 (see the `compile_error!` guard in `crates/tymigrawr/src/lib.rs`): each links a
-different SQLite-compatible C library (`sqlite3-sys` vs `libdoltlite-sys`), and
-linking both into one binary causes native-symbol collisions that hang the
-migration tests. Run each backend's tests in a separate `cargo test`
-invocation. The default feature set is `backend_sqlite` only.
+different SQLite-compatible C library (`sqlite3-sys` via `sqlx` vs
+`libdoltlite-sys` via `rusqdoltlite`), and linking both into one binary causes
+native-symbol collisions that hang the migration tests. Run each backend's
+tests in a separate `cargo test` invocation. The default feature set is
+`backend_sqlite` only.
+
+All tests are `async` and driven by `#[tokio::test]`. The doltlite backend uses
+`tokio::task::block_in_place` to call the blocking `rusqlite` API inline, so
+its tests use `#[tokio::test(flavor = "multi_thread")]` — they require a
+multi-threaded tokio runtime.
 
 ```sh
 # Default (backend_sqlite only)
 cargo test -p tymigrawr
 cargo test -p tymigrawr-derive
 
-# Doltlite backend only
+# Doltlite backend only (multi-thread runtime required)
 cargo test -p tymigrawr --no-default-features --features backend_doltlite
 
 # TOML backend only (can combine with sqlite safely, but not with doltlite)
@@ -57,14 +63,18 @@ cargo test -p tymigrawr --no-default-features --features backend_sqlite,backend_
 cargo test -p tymigrawr -- p1_crud
 cargo test -p tymigrawr --no-default-features --features backend_doltlite -- migrate
 RUST_LOG=trace cargo test -p tymigrawr -- --nocapture   # visible log output
+
+# WASM check (IndexedDB backend — can't run tests without a browser harness)
+cargo check -p tymigrawr --target wasm32-unknown-unknown --no-default-features --features backend_indexeddb
 ```
 
 All tests live in a `#[cfg(test)] mod test` block at the bottom of
 `crates/tymigrawr/src/lib.rs`, split into `sqlite_tests`, `doltlite_tests`,
 and `toml_tests` submodules gated on their respective features. There are no
-integration tests or tests in the derive crate. Tests use in-memory SQLite
-(`sqlite::open(":memory:")` / `rusqlite::Connection::open_in_memory()`) and
-`tempfile` for on-disk databases.
+integration tests or tests in the derive crate. SQLite tests use an in-memory
+`sqlx::SqlitePool` (`SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:")`)
+and `tempfile` for on-disk databases. Doltlite tests use
+`rusqlite::Connection::open_in_memory()`.
 
 ## Architecture
 
@@ -76,21 +86,29 @@ integration tests or tests in the derive crate. Tests use in-memory SQLite
    table name, column schema, and primary key.
 3. **`Crud<Backend>`** — blanket-implemented for all `T: HasCrudFields + Clone + 'static`.
    Provides `create`, `insert`, `read_all`, `read_where`, `read`, `update`, `delete`,
-   and `migration()` methods.
+   and `migration()` methods. **All methods are `async fn`** (async-by-default);
+   callers must `.await` them. Read methods return a `Pin<Box<dyn Stream<Item = Result<T, Error<E>>> + 'a>>`.
 4. **`MigrateEntireTable`** — backend-specific trait for bulk migration operations.
-   Implemented by `Sqlite` marker struct.
+   All methods are `async fn`. Implemented by `Sqlite`, `Doltlite`, `Toml`, and `IndexedDb`.
 
 ### Backend Pattern
 
-Backends are feature-gated unit structs (currently only `Sqlite`) with
-`#[cfg(feature = "backend_sqlite")]`. The `Crud` and `MigrateEntireTable` traits use a
-GAT `Connection<'a>` so each backend defines its own connection type.
+Backends are feature-gated unit structs (`Sqlite`, `Doltlite`, `Toml`, `IndexedDb`)
+with `#[cfg(feature = "backend_*")]`. The `Crud` and `MigrateEntireTable` traits use a
+GAT `Connection<'a>: Copy` so each backend defines its own connection type:
+
+- **`Sqlite`** — `&'a sqlx::SqlitePool` (natively async via `sqlx`).
+- **`Doltlite`** — `&'a rusqlite::Connection` (blocking; wrapped in
+  `tokio::task::block_in_place`, requires multi-thread runtime).
+- **`Toml`** — `&'a Path` (async via `tokio::fs`).
+- **`IndexedDb`** — `&'a str` (natively async via `rexie` on `wasm32`).
 
 ### Migration Pattern
 
 `Migrations<T, Backend>` is a builder that chains `.with_version::<NextType>()` calls.
 Each step is type-erased into a `Migration` struct holding boxed closures. Call
-`.run(&connection)` to execute forward or reverse migrations depending on chain order.
+`.run(&connection).await` or `.run_with(|table| ..., &connection).await` to execute
+forward or reverse migrations depending on chain order.
 
 ## Code Style Guidelines
 

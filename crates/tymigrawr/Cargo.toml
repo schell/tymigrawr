@@ -7,21 +7,24 @@ edition = "2021"
 
 [features]
 default = ["backend_sqlite"]
-backend_sqlite = ["sqlite"]
-backend_toml = ["dep:toml"]
-backend_doltlite = ["rusqdoltlite"]
+backend_sqlite = ["dep:sqlx"]
+backend_toml = ["dep:toml", "dep:tokio"]
+backend_doltlite = ["dep:rusqdoltlite", "dep:tokio"]
 backend_indexeddb = ["dep:rexie", "dep:web-sys", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:serde-wasm-bindgen"]
 schemars = ["dep:schemars"]
 
 [dependencies]
+async-stream = "0.3"
 base64 = "0.22"
-rusqdoltlite = { version = "0.40", optional = true }
+futures = "0.3"
 log = "0.4"
+rusqdoltlite = { version = "0.40", optional = true }
 schemars = { version = "1.2.1", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 snafu = "0.8"
-sqlite = { version = "0.37", optional = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "fs"], optional = true }
 toml = { version = "0.8", optional = true }
 tymigrawr-derive = { version = "0.1.0", path = "../tymigrawr-derive" }
 
@@ -36,3 +39,4 @@ serde-wasm-bindgen = { version = "0.6", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 env_logger = "0.10"
 tempfile = "3.8"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

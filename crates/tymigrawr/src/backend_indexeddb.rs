@@ -1,19 +1,20 @@
 //! IndexedDB backend for WASM targets.
 //!
 //! Each table is an IndexedDB object store. Each row is stored as a JSON
-//! value keyed by its primary key. The sync `Crud` trait methods are bridged
-//! to IndexedDB's async API via `wasm_bindgen_futures::spawn_local` + a
-//! channel.
+//! value keyed by its primary key.
 //!
-//! The `Connection` type is `&str` — the database name.
+//! The `Connection` type is `&str` — the database name. All `Crud` trait
+//! methods are `async` and await the underlying `rexie` futures directly.
 
 use crate::{
-    error::{DomainError, TymResult},
-    Crud, CrudBackend, CrudField, Error, HasCrudFields, IsCrudField, MigrateEntireTable, Value,
+    error::{DomainError, Error, TymResult},
+    Crud, CrudBackend, CrudField, HasCrudFields, IsCrudField, MigrateEntireTable, Value,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, pin::Pin};
 
+use async_stream::try_stream;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use futures::{Stream, StreamExt};
 use wasm_bindgen::JsValue;
 
 /// IndexedDB backend marker type.
@@ -35,26 +36,48 @@ impl std::error::Error for IndexedDbError {}
 
 impl From<rexie::Error> for IndexedDbError {
     fn from(e: rexie::Error) -> Self {
-        Self { message: e.to_string() }
+        Self {
+            message: e.to_string(),
+        }
     }
 }
 
 impl From<serde_json::Error> for IndexedDbError {
     fn from(e: serde_json::Error) -> Self {
-        Self { message: format!("serde error: {e}") }
+        Self {
+            message: format!("serde error: {e}"),
+        }
     }
+}
+
+impl From<IndexedDbError> for Error<IndexedDbError> {
+    fn from(inner: IndexedDbError) -> Self {
+        Error::Backend {
+            source: DomainError { inner },
+        }
+    }
+}
+
+/// Wrap any error convertible to `IndexedDbError` as an `Error<IndexedDbError>`.
+fn bd_err<E>(e: E) -> Error<IndexedDbError>
+where
+    IndexedDbError: From<E>,
+{
+    Error::from(IndexedDbError::from(e))
 }
 
 /// Convert a serde_json::Value to a JsValue for IDB storage.
 fn to_js_value(value: &serde_json::Value) -> Result<JsValue, IndexedDbError> {
-    serde_wasm_bindgen::to_value(value)
-        .map_err(|e| IndexedDbError { message: e.to_string() })
+    serde_wasm_bindgen::to_value(value).map_err(|e| IndexedDbError {
+        message: e.to_string(),
+    })
 }
 
 /// Convert a JsValue back to a serde_json::Value.
 fn from_js_value(value: &JsValue) -> Result<serde_json::Value, IndexedDbError> {
-    serde_wasm_bindgen::from_value(value.clone())
-        .map_err(|e| IndexedDbError { message: e.to_string() })
+    serde_wasm_bindgen::from_value(value.clone()).map_err(|e| IndexedDbError {
+        message: e.to_string(),
+    })
 }
 
 impl CrudBackend for IndexedDb {
@@ -70,23 +93,6 @@ async fn open_db(db_name: &str, store_name: &str) -> Result<rexie::Rexie, Indexe
         .build()
         .await?;
     Ok(rexie)
-}
-
-/// Block on an async future from sync context in WASM.
-fn block_on_async<F, T>(fut: F) -> Result<T, IndexedDbError>
-where
-    F: std::future::Future<Output = Result<T, IndexedDbError>> + 'static,
-    T: Send + 'static,
-{
-    use std::sync::mpsc;
-    let (tx, rx) = mpsc::channel::<Result<T, IndexedDbError>>();
-    wasm_bindgen_futures::spawn_local(async move {
-        let result = fut.await;
-        let _ = tx.send(result);
-    });
-    rx.recv().map_err(|_| IndexedDbError {
-        message: "async operation panicked".to_string(),
-    })?
 }
 
 /// Serialize a row's crud fields to a JSON object.
@@ -132,7 +138,10 @@ fn json_to_row(
             _ => Value::None,
         };
         // SAFETY: field.name is a &'static str from the HasCrudFields trait
-        result.insert(unsafe { std::mem::transmute::<&str, &'static str>(field.name) }, value);
+        result.insert(
+            unsafe { std::mem::transmute::<&str, &'static str>(field.name) },
+            value,
+        );
     }
     Ok(result)
 }
@@ -153,88 +162,87 @@ fn pk_as_json(fields: &HashMap<&str, Value>, crud_fields: &[CrudField]) -> serde
 }
 
 impl<T: HasCrudFields + Clone + Sized + 'static> Crud<IndexedDb> for T {
-    fn create(connection: &str) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
+    async fn create<'a>(connection: &str) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
         let db_name = connection.to_string();
         let store_name = Self::table_name().to_string();
-        block_on_async(async move {
-            let _rexie = open_db(&db_name, &store_name).await?;
-            Ok(())
-        })
-        .map_err(|e| DomainError { inner: e })?;
+        let _rexie = open_db(&db_name, &store_name).await.map_err(bd_err)?;
         Ok(())
     }
 
-    fn insert(
+    async fn insert<'a>(
         &mut self,
         connection: &str,
     ) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
         let store_name = Self::table_name().to_string();
         let fields = self.as_crud_fields();
         let crud_fields = Self::crud_fields();
-        let row_json = row_to_json(&fields).map_err(|e| DomainError { inner: e })?;
+        let row_json = row_to_json(&fields).map_err(bd_err)?;
         let pk_json = pk_as_json(&fields, &crud_fields);
         let db_name = connection.to_string();
 
-        block_on_async(async move {
-            let rexie = open_db(&db_name, &store_name).await?;
-            let transaction = rexie.transaction(&[&store_name], rexie::TransactionMode::ReadWrite)?;
-            let store = transaction.store(&store_name)?;
-            let row_js = to_js_value(&row_json)?;
-            let pk_js = to_js_value(&pk_json)?;
-            store.put(&row_js, Some(&pk_js)).await?;
-            transaction.done().await?;
-            Ok(())
-        })
-        .map_err(|e| DomainError { inner: e })?;
+        let rexie = open_db(&db_name, &store_name).await.map_err(bd_err)?;
+        let transaction = rexie
+            .transaction(&[&store_name], rexie::TransactionMode::ReadWrite)
+            .map_err(bd_err)?;
+        let store = transaction.store(&store_name).map_err(bd_err)?;
+        let row_js = to_js_value(&row_json).map_err(bd_err)?;
+        let pk_js = to_js_value(&pk_json).map_err(bd_err)?;
+        store.put(&row_js, Some(&pk_js)).await.map_err(bd_err)?;
+        transaction.done().await.map_err(bd_err)?;
         Ok(())
     }
 
-    fn upsert(
+    async fn upsert<'a>(
         &mut self,
         connection: &str,
     ) -> Result<bool, Error<<IndexedDb as CrudBackend>::Error>> {
-        self.insert(connection)?;
+        self.insert(connection).await?;
         Ok(true)
     }
 
-    fn read_all<'a>(
+    async fn read_all<'a>(
         connection: <IndexedDb as CrudBackend>::Connection<'a>,
-    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, IndexedDbError>> + 'a>, IndexedDbError> {
+    ) -> TymResult<
+        Pin<Box<dyn Stream<Item = Result<Self, Error<IndexedDbError>>> + 'a>>,
+        IndexedDbError,
+    > {
         let db_name = connection.to_string();
         let store_name = Self::table_name().to_string();
         let fields = Self::crud_fields();
 
-        let all_rows: Vec<serde_json::Value> = block_on_async(async move {
-            let rexie = open_db(&db_name, &store_name).await?;
-            let transaction = rexie.transaction(&[&store_name], rexie::TransactionMode::ReadOnly)?;
-            let store = transaction.store(&store_name)?;
-            let all_js = store.get_all(None, None).await?;
-            transaction.done().await?;
+        let all_rows: Vec<serde_json::Value> = {
+            let rexie = open_db(&db_name, &store_name).await.map_err(bd_err)?;
+            let transaction = rexie
+                .transaction(&[&store_name], rexie::TransactionMode::ReadOnly)
+                .map_err(bd_err)?;
+            let store = transaction.store(&store_name).map_err(bd_err)?;
+            let all_js = store.get_all(None, None).await.map_err(bd_err)?;
+            transaction.done().await.map_err(bd_err)?;
             let mut all = Vec::with_capacity(all_js.len());
             for js in all_js {
                 all.push(from_js_value(&js)?);
             }
-            Ok(all)
-        })
-        .map_err(|e| DomainError { inner: e })?;
+            all
+        };
 
-        let rows: Vec<TymResult<Self, IndexedDbError>> = all_rows
-            .into_iter()
-            .map(|json| {
+        let stream = try_stream! {
+            for json in all_rows {
                 let cols = json_to_row(&json, &fields)?;
-                Ok(Self::try_from_crud_fields(&cols)?)
-            })
-            .collect();
-
-        Ok(Box::new(rows.into_iter()))
+                yield Self::try_from_crud_fields(&cols)?;
+            }
+        };
+        Ok(Box::pin(stream))
     }
 
-    fn read_where<'a>(
+    async fn read_where<'a, Key: IsCrudField + 'a>(
         connection: <IndexedDb as CrudBackend>::Connection<'a>,
         key_name: &'a str,
         _comparison: &'a str,
-        key_value: impl IsCrudField,
-    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, IndexedDbError>> + 'a>, IndexedDbError> {
+        key_value: Key,
+    ) -> TymResult<
+        Pin<Box<dyn Stream<Item = Result<Self, Error<IndexedDbError>>> + 'a>>,
+        IndexedDbError,
+    > {
         let key_val = key_value.value();
         let target_key = match &key_val {
             Value::String(s) => s.clone(),
@@ -242,11 +250,12 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<IndexedDb> for T {
             _ => key_val.to_string(),
         };
 
-        let all: Vec<_> = <Self as Crud<IndexedDb>>::read_all(connection)?
-            .filter_map(|r| r.ok())
+        let all: Vec<_> = <Self as Crud<IndexedDb>>::read_all(connection)
+            .await?
+            .filter_map(|r| async move { r.ok() })
             .filter(|row| {
                 let fields = row.as_crud_fields();
-                if let Some(v) = fields.get(key_name) {
+                let matches = if let Some(v) = fields.get(key_name) {
                     match v {
                         Value::String(s) => s == &target_key,
                         Value::Integer(i) => i.to_string() == target_key,
@@ -254,54 +263,57 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<IndexedDb> for T {
                     }
                 } else {
                     false
-                }
+                };
+                async move { matches }
             })
-            .collect();
+            .collect()
+            .await;
 
-        Ok(Box::new(all.into_iter().map(Ok)))
+        Ok(Box::pin(futures::stream::iter(all.into_iter().map(Ok))))
     }
 
-    fn read<'a, Key: IsCrudField>(
+    async fn read<'a, Key: IsCrudField + 'a>(
         connection: <IndexedDb as CrudBackend>::Connection<'a>,
         key: Key,
-    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, IndexedDbError>> + 'a>, IndexedDbError> {
-        let iterator = <Self as Crud<IndexedDb>>::read_where(
-            connection,
-            Self::primary_key_name(),
-            "=",
-            key,
-        )?;
-        Ok(iterator)
+    ) -> TymResult<
+        Pin<Box<dyn Stream<Item = Result<Self, Error<IndexedDbError>>> + 'a>>,
+        IndexedDbError,
+    > {
+        <Self as Crud<IndexedDb>>::read_where(connection, Self::primary_key_name(), "=", key).await
     }
 
-    fn update(&self, connection: &str) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
+    async fn update<'a>(
+        &self,
+        connection: &str,
+    ) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
         let mut clone = self.clone();
-        clone.insert(connection)
+        clone.insert(connection).await
     }
 
-    fn delete(self, connection: &str) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
+    async fn delete<'a>(
+        self,
+        connection: &str,
+    ) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
         let store_name = Self::table_name().to_string();
         let fields = self.as_crud_fields();
         let crud_fields = Self::crud_fields();
         let pk_json = pk_as_json(&fields, &crud_fields);
         let db_name = connection.to_string();
 
-        block_on_async(async move {
-            let rexie = open_db(&db_name, &store_name).await?;
-            let transaction = rexie.transaction(&[&store_name], rexie::TransactionMode::ReadWrite)?;
-            let store = transaction.store(&store_name)?;
-            let pk_js = to_js_value(&pk_json)?;
-            store.delete(pk_js).await?;
-            transaction.done().await?;
-            Ok(())
-        })
-        .map_err(|e| DomainError { inner: e })?;
+        let rexie = open_db(&db_name, &store_name).await.map_err(bd_err)?;
+        let transaction = rexie
+            .transaction(&[&store_name], rexie::TransactionMode::ReadWrite)
+            .map_err(bd_err)?;
+        let store = transaction.store(&store_name).map_err(bd_err)?;
+        let pk_js = to_js_value(&pk_json).map_err(bd_err)?;
+        store.delete(pk_js).await.map_err(bd_err)?;
+        transaction.done().await.map_err(bd_err)?;
         Ok(())
     }
 }
 
 impl MigrateEntireTable for IndexedDb {
-    fn read_all_values<'a>(
+    async fn read_all_values<'a>(
         connection: <IndexedDb as CrudBackend>::Connection<'a>,
         table_name: &'a str,
         fields: Vec<CrudField>,
@@ -309,19 +321,20 @@ impl MigrateEntireTable for IndexedDb {
         let db_name = connection.to_string();
         let store_name = table_name.to_string();
 
-        let all_json: Vec<serde_json::Value> = block_on_async(async move {
-            let rexie = open_db(&db_name, &store_name).await?;
-            let transaction = rexie.transaction(&[&store_name], rexie::TransactionMode::ReadOnly)?;
-            let store = transaction.store(&store_name)?;
-            let all_js = store.get_all(None, None).await?;
-            transaction.done().await?;
+        let all_json: Vec<serde_json::Value> = {
+            let rexie = open_db(&db_name, &store_name).await.map_err(bd_err)?;
+            let transaction = rexie
+                .transaction(&[&store_name], rexie::TransactionMode::ReadOnly)
+                .map_err(bd_err)?;
+            let store = transaction.store(&store_name).map_err(bd_err)?;
+            let all_js = store.get_all(None, None).await.map_err(bd_err)?;
+            transaction.done().await.map_err(bd_err)?;
             let mut all = Vec::with_capacity(all_js.len());
             for js in all_js {
                 all.push(from_js_value(&js)?);
             }
-            Ok(all)
-        })
-        .map_err(|e| DomainError { inner: e })?;
+            all
+        };
 
         let rows = all_json
             .into_iter()
@@ -333,12 +346,12 @@ impl MigrateEntireTable for IndexedDb {
         Ok(rows)
     }
 
-    fn insert_fields(
+    async fn insert_fields<'a>(
         connection: &str,
         table_name: &str,
         fields: &HashMap<&str, Value>,
     ) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
-        let row_json = row_to_json(fields).map_err(|e| DomainError { inner: e })?;
+        let row_json = row_to_json(fields).map_err(bd_err)?;
         let pk_json = fields
             .iter()
             .next()
@@ -351,35 +364,31 @@ impl MigrateEntireTable for IndexedDb {
 
         let db_name = connection.to_string();
         let store_name = table_name.to_string();
-        block_on_async(async move {
-            let rexie = open_db(&db_name, &store_name).await?;
-            let transaction = rexie.transaction(&[&store_name], rexie::TransactionMode::ReadWrite)?;
-            let store = transaction.store(&store_name)?;
-            let row_js = to_js_value(&row_json)?;
-            let pk_js = to_js_value(&pk_json)?;
-            store.put(&row_js, Some(&pk_js)).await?;
-            transaction.done().await?;
-            Ok(())
-        })
-        .map_err(|e| DomainError { inner: e })?;
+        let rexie = open_db(&db_name, &store_name).await.map_err(bd_err)?;
+        let transaction = rexie
+            .transaction(&[&store_name], rexie::TransactionMode::ReadWrite)
+            .map_err(bd_err)?;
+        let store = transaction.store(&store_name).map_err(bd_err)?;
+        let row_js = to_js_value(&row_json).map_err(bd_err)?;
+        let pk_js = to_js_value(&pk_json).map_err(bd_err)?;
+        store.put(&row_js, Some(&pk_js)).await.map_err(bd_err)?;
+        transaction.done().await.map_err(bd_err)?;
         Ok(())
     }
 
-    fn delete_all(
+    async fn delete_all<'a>(
         connection: &str,
         table_name: &str,
     ) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
         let db_name = connection.to_string();
         let store_name = table_name.to_string();
-        block_on_async(async move {
-            let rexie = open_db(&db_name, &store_name).await?;
-            let transaction = rexie.transaction(&[&store_name], rexie::TransactionMode::ReadWrite)?;
-            let store = transaction.store(&store_name)?;
-            store.clear().await?;
-            transaction.done().await?;
-            Ok(())
-        })
-        .map_err(|e| DomainError { inner: e })?;
+        let rexie = open_db(&db_name, &store_name).await.map_err(bd_err)?;
+        let transaction = rexie
+            .transaction(&[&store_name], rexie::TransactionMode::ReadWrite)
+            .map_err(bd_err)?;
+        let store = transaction.store(&store_name).map_err(bd_err)?;
+        store.clear().await.map_err(bd_err)?;
+        transaction.done().await.map_err(bd_err)?;
         Ok(())
     }
 }
