@@ -35,12 +35,13 @@ cargo clippy -p tymigrawr-derive   # lint derive crate only
 ### Test
 
 The `backend_sqlite` and `backend_doltlite` features are mutually exclusive
-(see the `compile_error!` guard in `crates/tymigrawr/src/lib.rs`): each links a
-different SQLite-compatible C library (`sqlite3-sys` via `sqlx` vs
-`libdoltlite-sys` via `rusqdoltlite`), and linking both into one binary causes
-native-symbol collisions that hang the migration tests. Run each backend's
-tests in a separate `cargo test` invocation. The default feature set is
-`backend_sqlite` only.
+(see the `compile_error!` guard in `crates/tymigrawr/src/lib.rs`): both link a
+SQLite-compatible C library into the same binary (`sqlite3-sys` via `sqlx`
+and `libdoltlite-sys` via `rusqdoltlite`). The link itself succeeds, but the
+two symbol tables collide at runtime — calls to `sqlite3_*` may dispatch to
+the wrong implementation, breaking in-memory DB sharing and other semantics.
+Run each backend's tests in a separate `cargo test` invocation. The default
+feature set is `backend_sqlite` only.
 
 All tests are `async` and driven by `#[tokio::test]`. The doltlite backend uses
 `tokio::task::block_in_place` to call the blocking `rusqlite` API inline, so

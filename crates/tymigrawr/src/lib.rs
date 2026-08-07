@@ -82,9 +82,11 @@ pub use tymigrawr_derive::HasCrudFields;
 #[cfg(all(feature = "backend_sqlite", feature = "backend_doltlite"))]
 compile_error!(
     "the `backend_sqlite` and `backend_doltlite` features are mutually exclusive: \
-     they link two incompatible SQLite-compatible C libraries (sqlite3-sys and \
-     libdoltlite-sys) into the same binary, causing native-symbol collisions that \
-     hang the migration tests; enable at most one at a time"
+     both link a SQLite-compatible C library into the same binary (sqlite3-sys via \
+     sqlx and libdoltlite-sys via rusqdoltlite), and while the link succeeds the two \
+     symbol tables collide at runtime — calls to `sqlite3_*` may dispatch to the \
+     wrong implementation, breaking in-memory DB sharing and other semantics; \
+     enable at most one at a time"
 );
 
 #[cfg(feature = "backend_sqlite")]
@@ -1517,8 +1519,15 @@ mod test {
             Ok(())
         }
 
-        // Then specialize on the backend at the edges of your application
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        // Then specialize on the backend at the edges of your application.
+        // Use max_connections(1) for in-memory pools: each connection gets its own
+        // in-memory database unless shared-cache is used, so a single-connection pool
+        // keeps all operations against the same in-memory DB.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         run::<Sqlite>(&pool).await.unwrap();
     }
 }
