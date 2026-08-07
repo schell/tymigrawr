@@ -10,7 +10,7 @@ use snafu::prelude::*;
 ///
 /// This enum categorizes all supported column types in the database. Each variant corresponds
 /// to a database-level type that can be stored and retrieved. The `Integer` variant is the default.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub enum ValueType {
     /// 64-bit signed integer (`i64`, `i32`, `u32`).
     #[default]

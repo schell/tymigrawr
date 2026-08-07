@@ -13,7 +13,7 @@ use std::{
 
 use async_stream::try_stream;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use snafu::prelude::*;
 
 use crate::{

@@ -161,6 +161,21 @@ fn pk_as_json(fields: &HashMap<&str, Value>, crud_fields: &[CrudField]) -> serde
     }
 }
 
+/// Partial ordering for `Value` variants of the same type.
+///
+/// Returns `None` when the values are of different types or otherwise
+/// incomparable (matching the behavior of the TOML backend).
+fn partial_cmp_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
+    match (lhs, rhs) {
+        (Value::Integer(a), Value::Integer(b)) => a.partial_cmp(b),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+        (Value::String(a), Value::String(b)) => a.partial_cmp(b),
+        (Value::Bytes(a), Value::Bytes(b)) => a.partial_cmp(b),
+        (Value::None, Value::None) => Some(std::cmp::Ordering::Equal),
+        _ => None,
+    }
+}
+
 impl<T: HasCrudFields + Clone + Sized + 'static> Crud<IndexedDb> for T {
     async fn create<'a>(connection: &str) -> Result<(), Error<<IndexedDb as CrudBackend>::Error>> {
         let db_name = connection.to_string();
@@ -237,32 +252,38 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<IndexedDb> for T {
     async fn read_where<'a, Key: IsCrudField + 'a>(
         connection: <IndexedDb as CrudBackend>::Connection<'a>,
         key_name: &'a str,
-        _comparison: &'a str,
+        comparison: &'a str,
         key_value: Key,
     ) -> TymResult<
         Pin<Box<dyn Stream<Item = Result<Self, Error<IndexedDbError>>> + 'a>>,
         IndexedDbError,
     > {
-        let key_val = key_value.value();
-        let target_key = match &key_val {
-            Value::String(s) => s.clone(),
-            Value::Integer(i) => i.to_string(),
-            _ => key_val.to_string(),
-        };
+        let rhs = key_value.value();
 
         let all: Vec<_> = <Self as Crud<IndexedDb>>::read_all(connection)
             .await?
             .filter_map(|r| async move { r.ok() })
             .filter(|row| {
                 let fields = row.as_crud_fields();
-                let matches = if let Some(v) = fields.get(key_name) {
-                    match v {
-                        Value::String(s) => s == &target_key,
-                        Value::Integer(i) => i.to_string() == target_key,
+                let matches = match fields.get(key_name) {
+                    Some(lhs) => match comparison {
+                        "=" => lhs == &rhs,
+                        "!=" => lhs != &rhs,
+                        "<" => partial_cmp_values(lhs, &rhs)
+                            .map(|o| o.is_lt())
+                            .unwrap_or(false),
+                        ">" => partial_cmp_values(lhs, &rhs)
+                            .map(|o| o.is_gt())
+                            .unwrap_or(false),
+                        "<=" => partial_cmp_values(lhs, &rhs)
+                            .map(|o| o.is_le())
+                            .unwrap_or(false),
+                        ">=" => partial_cmp_values(lhs, &rhs)
+                            .map(|o| o.is_ge())
+                            .unwrap_or(false),
                         _ => false,
-                    }
-                } else {
-                    false
+                    },
+                    None => false,
                 };
                 async move { matches }
             })

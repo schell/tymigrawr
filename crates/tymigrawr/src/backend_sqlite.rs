@@ -221,15 +221,15 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     ) -> TymResult<Pin<Box<dyn Stream<Item = Result<Self, Error<sqlx::Error>>> + 'a>>, sqlx::Error>
     {
         let table_name = Self::table_name();
-        let column_names: Vec<&'static str> = Self::crud_fields().iter().map(|f| f.name).collect();
+        let fields = Self::crud_fields();
         let statement = format!("SELECT * FROM {table_name};");
         let stream = try_stream! {
             let mut rows = sqlx::query(&statement).fetch(connection);
             while let Some(row) = rows.try_next().await.map_err(DomainError::from)? {
                 let mut cols: HashMap<&str, Value> = HashMap::default();
-                for name in column_names.iter() {
-                    let v = row_to_value(&row, name);
-                    cols.insert(*name, v);
+                for field in fields.iter() {
+                    let v = row_to_value(&row, field.name, field.ty)?;
+                    cols.insert(field.name, v);
                 }
                 yield Self::try_from_crud_fields(&cols)?;
             }
@@ -245,7 +245,7 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     ) -> TymResult<Pin<Box<dyn Stream<Item = Result<Self, Error<sqlx::Error>>> + 'a>>, sqlx::Error>
     {
         let table_name = Self::table_name();
-        let column_names: Vec<&'static str> = Self::crud_fields().iter().map(|f| f.name).collect();
+        let fields = Self::crud_fields();
         let statement = format!("SELECT * FROM {table_name} WHERE {key_name} {comparison} ?");
         let stream = try_stream! {
             let mut query = sqlx::query(&statement);
@@ -253,9 +253,9 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             let mut rows = query.fetch(connection);
             while let Some(row) = rows.try_next().await.map_err(DomainError::from)? {
                 let mut cols: HashMap<&str, Value> = HashMap::default();
-                for name in column_names.iter() {
-                    let v = row_to_value(&row, name);
-                    cols.insert(*name, v);
+                for field in fields.iter() {
+                    let v = row_to_value(&row, field.name, field.ty)?;
+                    cols.insert(field.name, v);
                 }
                 yield Self::try_from_crud_fields(&cols)?;
             }
@@ -380,23 +380,64 @@ impl CrudField {
     }
 }
 
-/// Read a column out of a `SqliteRow` into a [`Value`].
+/// Decode a column out of a `SqliteRow` into a [`Value`], using the expected
+/// [`ValueType`] from the field schema rather than guessing by trial-and-error.
 ///
-/// Tries the column-typed decode paths in order to detect null vs typed value.
-fn row_to_value(row: &sqlx::sqlite::SqliteRow, name: &str) -> Value {
-    if let Ok(v) = row.try_get::<Option<i64>, _>(name) {
-        return v.map(Value::Integer).unwrap_or(Value::None);
+/// SQLite is dynamically typed, so without the expected type a TEXT value like
+/// `"123"` could be mis-decoded as an integer. Decoding by `ValueType` ensures
+/// round-trip fidelity.
+///
+/// Returns `Err(InvalidValue)` when the stored value cannot be decoded as the
+/// expected type (e.g. a TEXT column holding non-UTF-8 bytes, or a NULL in a
+/// non-nullable position that the caller may still want to surface).
+fn row_to_value(
+    row: &sqlx::sqlite::SqliteRow,
+    name: &str,
+    ty: ValueType,
+) -> Result<Value, Error<sqlx::Error>> {
+    use crate::error::InvalidValueSnafu;
+    match ty {
+        ValueType::Integer => {
+            let v: Option<i64> = row.try_get(name).map_err(|e| {
+                InvalidValueSnafu {
+                    field: name.to_string(),
+                    reason: e.to_string(),
+                }
+                .build()
+            })?;
+            Ok(v.map(Value::Integer).unwrap_or(Value::None))
+        }
+        ValueType::Float => {
+            let v: Option<f64> = row.try_get(name).map_err(|e| {
+                InvalidValueSnafu {
+                    field: name.to_string(),
+                    reason: e.to_string(),
+                }
+                .build()
+            })?;
+            Ok(v.map(Value::Float).unwrap_or(Value::None))
+        }
+        ValueType::String => {
+            let v: Option<String> = row.try_get(name).map_err(|e| {
+                InvalidValueSnafu {
+                    field: name.to_string(),
+                    reason: e.to_string(),
+                }
+                .build()
+            })?;
+            Ok(v.map(Value::String).unwrap_or(Value::None))
+        }
+        ValueType::Bytes => {
+            let v: Option<Vec<u8>> = row.try_get(name).map_err(|e| {
+                InvalidValueSnafu {
+                    field: name.to_string(),
+                    reason: e.to_string(),
+                }
+                .build()
+            })?;
+            Ok(v.map(Value::Bytes).unwrap_or(Value::None))
+        }
     }
-    if let Ok(v) = row.try_get::<Option<f64>, _>(name) {
-        return v.map(Value::Float).unwrap_or(Value::None);
-    }
-    if let Ok(v) = row.try_get::<Option<String>, _>(name) {
-        return v.map(Value::String).unwrap_or(Value::None);
-    }
-    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(name) {
-        return v.map(Value::Bytes).unwrap_or(Value::None);
-    }
-    Value::None
 }
 
 impl MigrateEntireTable for Sqlite {
@@ -405,7 +446,6 @@ impl MigrateEntireTable for Sqlite {
         table_name: &'a str,
         fields: Vec<CrudField>,
     ) -> TymResult<Vec<ReadAllValuesResult<'a, Self::Error>>, Self::Error> {
-        let column_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         let statement = format!("SELECT * FROM {table_name};");
 
         // sqlx::query().fetch() returns a Stream directly (no Result). The "no such table"
@@ -417,11 +457,20 @@ impl MigrateEntireTable for Sqlite {
             match stream.try_next().await {
                 Ok(Some(row)) => {
                     let mut cols = HashMap::default();
-                    for name in column_names.iter() {
-                        let v = row_to_value(&row, name);
-                        cols.insert(*name, v);
+                    for field in fields.iter() {
+                        match row_to_value(&row, field.name, field.ty) {
+                            Ok(v) => {
+                                cols.insert(field.name, v);
+                            }
+                            Err(e) => {
+                                cursor.push(Err(e));
+                                break;
+                            }
+                        }
                     }
-                    cursor.push(Ok(cols));
+                    if cols.len() == fields.len() {
+                        cursor.push(Ok(cols));
+                    }
                 }
                 Ok(None) => break,
                 Err(sqlx::Error::Database(ref db_err))
