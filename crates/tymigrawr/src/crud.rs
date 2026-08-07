@@ -36,30 +36,33 @@ type ReadStream<'a, T, Backend> =
 /// # Examples
 ///
 /// ```rust,ignore
-/// use tymigrawr::{Crud, CrudBackend, HasCrudFields, PrimaryKey, Sqlite};
+/// use tymigrawr::{Crud, CrudBackend, HasCrudFields, PrimaryKey};
+/// use futures::StreamExt;
+///
 /// /// Define a business type that can be persisted.
 /// #[derive(Debug, Clone, HasCrudFields)]
 /// struct User {
 ///     id: PrimaryKey<i64>,
 ///     name: String,
 /// }
-/// /// For the most part, business logic involving persistance can be generic over the backend.
+///
+/// /// For the most part, business logic involving persistence can be generic over the backend.
 /// async fn run<'a, Backend: CrudBackend>(
-///     pool: &'a sqlx::SqlitePool,
+///     conn: Backend::Connection<'a>,
 /// ) -> Result<(), tymigrawr::Error<Backend::Error>>
 /// where
 ///     User: Crud<Backend>,
 /// {
 ///     // Create table
-///     User::create(pool).await?;
+///     User::create(conn).await?;
 ///     // Insert
 ///     let mut user = User {
 ///         id: PrimaryKey::new(1),
 ///         name: "Alice".to_string(),
 ///     };
-///     user.insert(pool).await?;
+///     user.insert(conn).await?;
 ///     // Read
-///     let mut users = User::read_all(pool).await?;
+///     let mut users = User::read_all(conn).await?;
 ///     while let Some(result) = users.next().await {
 ///         let user = result?;
 ///         println!("{}", user.name);
@@ -92,7 +95,7 @@ where
 
     /// Inserts a row, or updates all non-primary-key columns if a row with the same primary key exists.
     ///
-    /// Takes `self` mutably because it updates the primary key in the case of insertinga record with
+    /// Takes `self` mutably because it updates the primary key in the case of inserting a record with
     /// auto incrementing primary keys.
     ///
     /// Returns `true` if the row was inserted or updated, `false` if no change was needed.

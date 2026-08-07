@@ -245,7 +245,11 @@ mod test {
         pub name: String,
     }
 
-    /// Pull exactly one item from a stream, unwrapping the outer Result and the row Result.
+    /// Pull exactly one item from a stream, unwrapping the row `Result`.
+    ///
+    /// The caller is responsible for unwrapping the `read_*().await` result
+    /// (the outer `Result<Stream, _>`); this macro takes the stream itself and
+    /// extracts the first item, panicking on early end-of-stream or a row error.
     macro_rules! one {
         ($stream:expr) => {{
             let mut s = $stream;
@@ -256,7 +260,11 @@ mod test {
         }};
     }
 
-    /// Collect all items from a stream into a Vec, unwrapping the outer Result and the row Result.
+    /// Collect all items from a stream into a `Vec`, unwrapping each row `Result`.
+    ///
+    /// The caller is responsible for unwrapping the `read_*().await` result
+    /// (the outer `Result<Stream, _>`); this macro takes the stream itself and
+    /// drains it, panicking on any row error.
     macro_rules! all {
         ($stream:expr) => {{
             let mut s = $stream;
@@ -1490,7 +1498,7 @@ mod test {
             name: String,
         }
 
-        /// For the most part, business logic involving persistance can be generic over the backend.
+        /// For the most part, business logic involving persistence can be generic over the backend.
         async fn run<'a, Backend: CrudBackend>(
             conn: Backend::Connection<'a>,
         ) -> Result<(), tymigrawr::Error<Backend::Error>>
