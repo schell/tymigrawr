@@ -1,10 +1,12 @@
 //! Create, read, update and delete operations on types.
 
 use crate::{crud_fields::*, error::*, Migration};
+use futures::Stream;
+use std::pin::Pin;
 
 /// A trait defining the interface for database backends.
 ///
-/// Each backend (SQLite, TOML, PostgreSQL, etc.) implements this trait to provide
+/// Each backend (SQLite, TOML, IndexedDB, etc.) implements this trait to provide
 /// a connection type and an error type. This abstraction allows the [`Crud`] trait
 /// to be backend-agnostic.
 pub trait CrudBackend: 'static {
@@ -17,23 +19,11 @@ pub trait CrudBackend: 'static {
     /// The error type for this backend.
     ///
     /// Must implement `Display` and `Debug` so it can be wrapped in the library's [`Error`] type.
-    type Error: core::fmt::Display + core::fmt::Debug + 'static;
+    type Error: core::fmt::Display + core::fmt::Debug + Send + Sync + 'static;
 }
 
-type ReadAllResult<'a, T, Backend> = Result<
-    Box<dyn Iterator<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>,
-    Error<<Backend as CrudBackend>::Error>,
->;
-
-type ReadWhereResult<'a, T, Backend> = Result<
-    Box<dyn Iterator<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>,
-    Error<<Backend as CrudBackend>::Error>,
->;
-
-type ReadResult<'a, T, Backend> = Result<
-    Box<dyn Iterator<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>,
-    Error<<Backend as CrudBackend>::Error>,
->;
+type ReadStream<'a, T, Backend> =
+    Pin<Box<dyn Stream<Item = Result<T, Error<<Backend as CrudBackend>::Error>>> + 'a>>;
 
 /// Provides CRUD (Create, Read, Update, Delete) operations for a type.
 ///
@@ -41,11 +31,11 @@ type ReadResult<'a, T, Backend> = Result<
 /// It provides database operations against any backend that implements [`CrudBackend`].
 ///
 /// The trait is generic over the backend, allowing the same type to be used with different storage systems
-/// (e.g., SQLite, TOML files).
+/// (e.g., SQLite, TOML files). All methods are `async` by default; callers must `.await` them.
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use tymigrawr::{Crud, CrudBackend, HasCrudFields, PrimaryKey, Sqlite};
 /// /// Define a business type that can be persisted.
 /// #[derive(Debug, Clone, HasCrudFields)]
@@ -54,31 +44,28 @@ type ReadResult<'a, T, Backend> = Result<
 ///     name: String,
 /// }
 /// /// For the most part, business logic involving persistance can be generic over the backend.
-/// fn run<'a, Backend: CrudBackend>(
-///     conn: Backend::Connection<'a>,
+/// async fn run<'a, Backend: CrudBackend>(
+///     pool: &'a sqlx::SqlitePool,
 /// ) -> Result<(), tymigrawr::Error<Backend::Error>>
 /// where
 ///     User: Crud<Backend>,
 /// {
 ///     // Create table
-///     User::create(conn)?;
+///     User::create(pool).await?;
 ///     // Insert
 ///     let mut user = User {
 ///         id: PrimaryKey::new(1),
 ///         name: "Alice".to_string(),
 ///     };
-///     user.insert(conn)?;
+///     user.insert(pool).await?;
 ///     // Read
-///     let users = User::read_all(conn)?;
-///     for result in users {
+///     let mut users = User::read_all(pool).await?;
+///     while let Some(result) = users.next().await {
 ///         let user = result?;
 ///         println!("{}", user.name);
 ///     }
 ///     Ok(())
 /// }
-/// // Then specialize on the backend at the edges of your application
-/// let conn = sqlite::open(":memory:").unwrap();
-/// run::<Sqlite>(&conn).unwrap();
 /// ```
 pub trait Crud<Backend>
 where
@@ -89,7 +76,7 @@ where
     ///
     /// This method generates and executes the appropriate DDL (Data Definition Language) statement
     /// to create a table with columns and constraints matching the schema defined by [`HasCrudFields`].
-    fn create(connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
+    async fn create<'a>(connection: Backend::Connection<'a>) -> TymResult<(), Backend::Error>;
 
     /// Inserts a single row into the table.
     ///
@@ -98,9 +85,9 @@ where
     ///
     /// ## Errors
     /// Errors if a row with the same primary key already exists.
-    fn insert(
+    async fn insert<'a>(
         &mut self,
-        connection: Backend::Connection<'_>,
+        connection: Backend::Connection<'a>,
     ) -> std::result::Result<(), Error<Backend::Error>>;
 
     /// Inserts a row, or updates all non-primary-key columns if a row with the same primary key exists.
@@ -109,15 +96,17 @@ where
     /// auto incrementing primary keys.
     ///
     /// Returns `true` if the row was inserted or updated, `false` if no change was needed.
-    fn upsert(
+    async fn upsert<'a>(
         &mut self,
-        connection: Backend::Connection<'_>,
+        connection: Backend::Connection<'a>,
     ) -> std::result::Result<bool, Error<Backend::Error>>;
 
     /// Reads all rows from the table.
     ///
-    /// Returns an iterator over the rows. Each item is a `Result`, allowing for per-row error handling.
-    fn read_all<'a>(connection: Backend::Connection<'a>) -> ReadAllResult<'a, Self, Backend>;
+    /// Returns an async [`Stream`] over the rows. Each item is a `Result`, allowing for per-row error handling.
+    async fn read_all<'a>(
+        connection: Backend::Connection<'a>,
+    ) -> TymResult<ReadStream<'a, Self, Backend>, Backend::Error>;
 
     /// Reads rows matching a condition.
     ///
@@ -128,13 +117,13 @@ where
     /// * `comparison` — A SQL comparison operator (e.g., `"="`, `">"`, `"<"`, `"LIKE"`).
     /// * `key_value` — The value to compare against.
     ///
-    /// Returns an iterator over matching rows.
-    fn read_where<'a>(
+    /// Returns an async [`Stream`] over matching rows.
+    async fn read_where<'a, Key: IsCrudField + 'a>(
         connection: Backend::Connection<'a>,
         key_name: &'a str,
         comparison: &'a str,
-        key_value: impl IsCrudField,
-    ) -> ReadWhereResult<'a, Self, Backend>;
+        key_value: Key,
+    ) -> TymResult<ReadStream<'a, Self, Backend>, Backend::Error>;
 
     /// Reads a single row by its primary key.
     ///
@@ -143,22 +132,26 @@ where
     /// * `connection` — The database connection.
     /// * `key` — The primary key value to look up.
     ///
-    /// Returns an iterator that contains at most one row (the database guarantees unique primary keys).
-    fn read<'a, Key: IsCrudField>(
+    /// Returns a stream that contains at most one row (the database guarantees unique primary keys).
+    async fn read<'a, Key: IsCrudField + 'a>(
         connection: Backend::Connection<'a>,
         key: Key,
-    ) -> ReadResult<'a, Self, Backend>;
+    ) -> TymResult<ReadStream<'a, Self, Backend>, Backend::Error>;
 
     /// Updates an existing row by its primary key.
     ///
     /// All columns except the primary key are updated to match the current values in this instance.
     /// Fails if no row with this primary key exists.
-    fn update(&self, connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
+    async fn update<'a>(
+        &self,
+        connection: Backend::Connection<'a>,
+    ) -> TymResult<(), Backend::Error>;
 
     /// Deletes a row by its primary key.
     ///
     /// Consumes `self` (moves ownership) to prevent accidental use of the deleted row afterward.
-    fn delete(self, connection: Backend::Connection<'_>) -> TymResult<(), Backend::Error>;
+    async fn delete<'a>(self, connection: Backend::Connection<'a>)
+        -> TymResult<(), Backend::Error>;
 
     /// Creates a migration step from type `T` to `Self`.
     ///

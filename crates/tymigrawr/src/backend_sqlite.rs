@@ -1,25 +1,95 @@
-//! Sqlite impl.
+//! Sqlite impl backed by `sqlx`.
 use std::collections::HashMap;
+use std::pin::Pin;
+
+use async_stream::try_stream;
+use futures::{Stream, TryStreamExt};
+use sqlx::{Row as _, SqlitePool};
 
 use crate::{
-    error::{DomainError, TymResult},
-    Crud, CrudBackend, CrudField, Error, HasCrudFields, HasCrudFieldsError, IsCrudField,
-    MigrateEntireTable, Migration, ReadAllValuesResult, Value, ValueType,
+    error::{DomainError, Error, TymResult},
+    Crud, CrudBackend, CrudField, HasCrudFields, IsCrudField, MigrateEntireTable,
+    ReadAllValuesResult, Value, ValueType,
 };
 
 pub struct Sqlite;
 
 impl CrudBackend for Sqlite {
-    type Connection<'a> = &'a sqlite::Connection;
-    type Error = sqlite::Error;
+    type Connection<'a> = &'a SqlitePool;
+    type Error = sqlx::Error;
+}
+
+/// Helper: bind a [`Value`] into a `sqlx::Query`/`QueryBuilder` by dispatching on its variant
+/// to the matching `Option<T>` Encode impl already provided by sqlx.
+enum Bound {
+    Int(Option<i64>),
+    Float(Option<f64>),
+    Text(Option<String>),
+    Blob(Option<Vec<u8>>),
+}
+
+impl Bound {
+    fn from(v: Value) -> Self {
+        match v {
+            Value::Integer(i) => Bound::Int(Some(i)),
+            Value::Float(f) => Bound::Float(Some(f)),
+            Value::String(s) => Bound::Text(Some(s)),
+            Value::Bytes(b) => Bound::Blob(Some(b)),
+            Value::None => Bound::Int(None),
+        }
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for Bound {
+    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+        <i64 as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for Bound {
+    fn encode(
+        self,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+    ) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Bound::Int(v) => v.encode(buf),
+            Bound::Float(v) => v.encode(buf),
+            Bound::Text(v) => v.encode(buf),
+            Bound::Blob(v) => v.encode(buf),
+        }
+    }
+
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+    ) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Bound::Int(v) => v.encode(buf),
+            Bound::Float(v) => v.encode(buf),
+            Bound::Text(v) => v.encode(buf),
+            Bound::Blob(v) => v.encode(buf),
+        }
+    }
+}
+
+fn bind_value<'q>(
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    v: Value,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    match Bound::from(v) {
+        Bound::Int(v) => query.bind(v),
+        Bound::Float(v) => query.bind(v),
+        Bound::Text(v) => query.bind(v),
+        Bound::Blob(v) => query.bind(v),
+    }
 }
 
 impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
     /// Create a table for `Self`, if it doesn't already exist.
     ///
     /// Implementations *must not* truncate the table if it already exists.
-    fn create(
-        connection: &sqlite::Connection,
+    async fn create<'a>(
+        connection: &SqlitePool,
     ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let fields: String = Self::crud_fields()
@@ -28,15 +98,16 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             .collect::<Vec<_>>()
             .join(", ");
         let statement = format!("CREATE TABLE IF NOT EXISTS {table_name} ({fields});");
-        connection
-            .execute(statement)
-            .map_err(|inner| DomainError { inner })?;
+        sqlx::query(&statement)
+            .execute(connection)
+            .await
+            .map_err(DomainError::from)?;
         Ok(())
     }
 
-    fn insert(
+    async fn insert<'a>(
         &mut self,
-        connection: &sqlite::Connection,
+        connection: &SqlitePool,
     ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let crud_fields = Self::crud_fields();
@@ -52,27 +123,23 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             }
         });
 
-        Sqlite::insert_fields(connection, table_name, &fields)?;
+        Sqlite::insert_fields(connection, table_name, &fields).await?;
 
         // If there was an auto_increment field with None value, update it with the generated ID
         if has_auto_increment.is_some() {
-            // Query the last inserted rowid
-            let mut stmt = connection
-                .prepare("SELECT last_insert_rowid()")
-                .map_err(|e| DomainError { inner: e })?;
-            if matches!(stmt.next(), Ok(sqlite::State::Row)) {
-                if let Ok(rowid) = stmt.read::<i64, _>(0) {
-                    self.set_primary_key(Value::Integer(rowid));
-                }
-            }
+            let rowid: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
+                .fetch_one(connection)
+                .await
+                .map_err(DomainError::from)?;
+            self.set_primary_key(Value::Integer(rowid));
         }
 
         Ok(())
     }
 
-    fn upsert(
+    async fn upsert<'a>(
         &mut self,
-        connection: &sqlite::Connection,
+        connection: &SqlitePool,
     ) -> Result<bool, Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let crud_fields = Self::crud_fields();
@@ -93,13 +160,6 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
             }
         }
 
-        let columns = field_values.keys().copied().collect::<Vec<_>>().join(", ");
-        let binds = field_values
-            .keys()
-            .map(|k| format!(":{}", k))
-            .collect::<Vec<_>>()
-            .join(", ");
-
         let primary_key = crud_fields
             .iter()
             .find(|f| f.primary_key)
@@ -110,189 +170,158 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
                 reason: "no primary key field".into(),
             })?;
 
-        let update_set = crud_fields
+        // Build statement using positional ? placeholders in sorted column order.
+        let mut keys: Vec<&str> = field_values.keys().copied().collect();
+        keys.sort_unstable();
+        let columns_csv = keys.join(", ");
+        let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+
+        let set_clause = crud_fields
             .iter()
             .filter(|f| f.name != primary_key)
             .map(|f| format!("{} = excluded.{}", f.name, f.name))
             .collect::<Vec<_>>()
             .join(", ");
 
-        let statement = if update_set.is_empty() || is_new_auto_increment {
-            // Only a primary key column or new auto_increment — nothing to update, just ignore conflicts
+        let statement = if set_clause.is_empty() || is_new_auto_increment {
             format!(
-                "INSERT INTO {table_name} ({columns}) VALUES ({binds}) \
+                "INSERT INTO {table_name} ({columns_csv}) VALUES ({placeholders}) \
                  ON CONFLICT({primary_key}) DO NOTHING"
             )
         } else {
             format!(
-                "INSERT INTO {table_name} ({columns}) VALUES ({binds}) \
-                 ON CONFLICT({primary_key}) DO UPDATE SET {update_set}"
+                "INSERT INTO {table_name} ({columns_csv}) VALUES ({placeholders}) \
+                 ON CONFLICT({primary_key}) DO UPDATE SET {set_clause}"
             )
         };
 
-        let mut query = connection
-            .prepare(&statement)
-            .map_err(|e| DomainError { inner: e })?;
-
-        for (key, value) in field_values.into_iter() {
-            let bind_key = format!(":{key}");
-            let v = sqlite::Value::from(value);
-            query
-                .bind((bind_key.as_str(), v))
-                .map_err(|e| DomainError { inner: e })?;
+        let mut query = sqlx::query(&statement);
+        for k in keys.iter() {
+            let v = field_values.get(k).cloned().unwrap_or(Value::None);
+            query = bind_value(query, v);
         }
 
-        if !matches!(query.next(), Ok(sqlite::State::Done)) {
-            return Err(Error::OperationFailed {
-                operation: "upsert".into(),
-                reason: "query not ok".into(),
-            });
-        }
+        let result = query.execute(connection).await.map_err(DomainError::from)?;
+        let changed = result.rows_affected() > 0;
 
         // If it was a new auto_increment record, update with the generated ID
         if is_new_auto_increment {
-            let mut stmt = connection
-                .prepare("SELECT last_insert_rowid()")
-                .map_err(|e| DomainError { inner: e })?;
-            if matches!(stmt.next(), Ok(sqlite::State::Row)) {
-                if let Ok(rowid) = stmt.read::<i64, _>(0) {
-                    self.set_primary_key(Value::Integer(rowid));
-                }
-            }
+            let rowid: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
+                .fetch_one(connection)
+                .await
+                .map_err(DomainError::from)?;
+            self.set_primary_key(Value::Integer(rowid));
         }
 
-        Ok(connection.change_count() > 0)
+        Ok(changed)
     }
 
-    fn read_all<'a>(
+    async fn read_all<'a>(
         connection: <Sqlite as CrudBackend>::Connection<'a>,
-    ) -> TymResult<Box<dyn Iterator<Item = TymResult<Self, sqlite::Error>> + 'a>, sqlite::Error>
+    ) -> TymResult<Pin<Box<dyn Stream<Item = Result<Self, Error<sqlx::Error>>> + 'a>>, sqlx::Error>
     {
         let table_name = Self::table_name();
-        let cursor = Sqlite::read_all_values(connection, table_name, Self::crud_fields())?;
-        Ok(Box::new(cursor.into_iter().map(|cols| {
-            let cols = cols?;
-            let value = Self::try_from_crud_fields(&cols)?;
-            Ok(value)
-        })))
+        let column_names: Vec<&'static str> = Self::crud_fields().iter().map(|f| f.name).collect();
+        let statement = format!("SELECT * FROM {table_name};");
+        let stream = try_stream! {
+            let mut rows = sqlx::query(&statement).fetch(connection);
+            while let Some(row) = rows.try_next().await.map_err(DomainError::from)? {
+                let mut cols: HashMap<&str, Value> = HashMap::default();
+                for name in column_names.iter() {
+                    let v = row_to_value(&row, name);
+                    cols.insert(*name, v);
+                }
+                yield Self::try_from_crud_fields(&cols)?;
+            }
+        };
+        Ok(Box::pin(stream))
     }
 
-    fn read_where<'a>(
-        connection: &'a sqlite::Connection,
+    async fn read_where<'a, Key: IsCrudField + 'a>(
+        connection: <Sqlite as CrudBackend>::Connection<'a>,
         key_name: &'a str,
         comparison: &'a str,
-        key_value: impl IsCrudField,
-    ) -> TymResult<
-        Box<dyn Iterator<Item = TymResult<Self, sqlite::Error>> + 'a>,
-        <Sqlite as CrudBackend>::Error,
-    > {
+        key_value: Key,
+    ) -> TymResult<Pin<Box<dyn Stream<Item = Result<Self, Error<sqlx::Error>>> + 'a>>, sqlx::Error>
+    {
         let table_name = Self::table_name();
-        let column_names = Self::crud_fields()
-            .iter()
-            .map(|field| field.name)
-            .collect::<Vec<_>>();
-        let statement =
-            format!("SELECT * FROM {table_name} WHERE {key_name} {comparison} :key_value");
-        let mut query = connection
-            .prepare(statement)
-            .map_err(|e| DomainError { inner: e })?;
-        let value = key_value.value();
-        let value = sqlite::Value::from(value);
-        query
-            .bind((":key_value", value))
-            .map_err(DomainError::from)?;
-        let cursor = query
-            .into_iter()
-            .map(move |row| -> TymResult<Self, sqlite::Error> {
-                let row = row.map_err(DomainError::from)?;
-                let mut cols = HashMap::default();
+        let column_names: Vec<&'static str> = Self::crud_fields().iter().map(|f| f.name).collect();
+        let statement = format!("SELECT * FROM {table_name} WHERE {key_name} {comparison} ?");
+        let stream = try_stream! {
+            let mut query = sqlx::query(&statement);
+            query = bind_value(query, key_value.value());
+            let mut rows = query.fetch(connection);
+            while let Some(row) = rows.try_next().await.map_err(DomainError::from)? {
+                let mut cols: HashMap<&str, Value> = HashMap::default();
                 for name in column_names.iter() {
-                    let value = &row[*name];
-                    let value = Value::from(value.clone());
-                    cols.insert(*name, value);
+                    let v = row_to_value(&row, name);
+                    cols.insert(*name, v);
                 }
-                Ok(Self::try_from_crud_fields(&cols)?)
-            });
-        Ok(Box::new(cursor))
+                yield Self::try_from_crud_fields(&cols)?;
+            }
+        };
+        Ok(Box::pin(stream))
     }
 
-    fn read<'a, Key: IsCrudField>(
+    async fn read<'a, Key: IsCrudField + 'a>(
         connection: <Sqlite as CrudBackend>::Connection<'a>,
         key: Key,
-    ) -> TymResult<
-        Box<dyn Iterator<Item = TymResult<Self, <Sqlite as CrudBackend>::Error>> + 'a>,
-        <Sqlite as CrudBackend>::Error,
-    > {
-        let iterator =
-            <Self as Crud<Sqlite>>::read_where(connection, Self::primary_key_name(), "=", key)?;
-        Ok(iterator
-            as Box<dyn Iterator<Item = TymResult<Self, <Sqlite as CrudBackend>::Error>> + 'a>)
+    ) -> TymResult<Pin<Box<dyn Stream<Item = Result<Self, Error<sqlx::Error>>> + 'a>>, sqlx::Error>
+    {
+        let stream =
+            <Self as Crud<Sqlite>>::read_where(connection, Self::primary_key_name(), "=", key)
+                .await?;
+        Ok(stream as Pin<Box<dyn Stream<Item = Result<Self, Error<sqlx::Error>>> + 'a>>)
     }
 
-    fn update(
+    async fn update<'a>(
         &self,
-        connection: &sqlite::Connection,
+        connection: &SqlitePool,
     ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let fields = self.as_crud_fields();
         let mut primary_key: Option<&str> = None;
-        let values = Self::crud_fields()
-            .iter()
-            .filter_map(|field| {
-                if field.primary_key {
-                    primary_key = Some(field.name);
-                    None
-                } else {
-                    Some(format!("{} = :{}", field.name, field.name))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut set_columns: Vec<&str> = Vec::new();
+        for field in Self::crud_fields().iter() {
+            if field.primary_key {
+                primary_key = Some(field.name);
+            } else {
+                set_columns.push(field.name);
+            }
+        }
         let primary_key = primary_key.ok_or_else(|| Error::OperationFailed {
             operation: "update".into(),
             reason: "no primary key field".into(),
         })?;
 
         let table_name = Self::table_name();
-        let statement =
-            format!("UPDATE {table_name} SET {values} WHERE {primary_key} = :key_value",);
-        let mut query = connection
-            .prepare(statement)
-            .map_err(|inner| DomainError { inner })?;
-        let mut key_value = None;
-        for (key, value) in fields.into_iter() {
-            if key == primary_key {
-                key_value = Some(value);
-                continue;
-            }
-            let key = format!(":{key}");
-            let k = key.as_str();
-            let v = sqlite::Value::from(value);
-            query.bind((k, v)).map_err(|e| DomainError { inner: e })?;
-        }
-        let key_value = key_value.ok_or_else(|| Error::OperationFailed {
-            operation: "delete".into(),
-            reason: "no key value".into(),
-        })?;
-        let key_value = sqlite::Value::from(key_value);
-        query
-            .bind((":key_value", key_value))
-            .map_err(|e| DomainError { inner: e })?;
+        let set_clause = set_columns
+            .iter()
+            .map(|c| format!("{c} = ?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statement = format!("UPDATE {table_name} SET {set_clause} WHERE {primary_key} = ?");
 
-        if let Ok(sqlite::State::Done) = query.next() {
-            Ok(())
-        } else {
-            Err(Error::OperationFailed {
+        let mut query = sqlx::query(&statement);
+        for c in set_columns.iter() {
+            let v = fields.get(c).cloned().unwrap_or(Value::None);
+            query = bind_value(query, v);
+        }
+        let key_val = fields.get(primary_key).cloned().unwrap_or(Value::None);
+        query = bind_value(query, key_val);
+
+        let result = query.execute(connection).await.map_err(DomainError::from)?;
+        if result.rows_affected() == 0 {
+            return Err(Error::OperationFailed {
                 operation: "update".into(),
                 reason: "no rows updated".into(),
-            })
-        }?;
-
+            });
+        }
         Ok(())
     }
 
-    fn delete(
+    async fn delete<'a>(
         self,
-        connection: &sqlite::Connection,
+        connection: &SqlitePool,
     ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let table_name = Self::table_name();
         let key_name = Self::crud_fields()
@@ -316,45 +345,16 @@ impl<T: HasCrudFields + Clone + Sized + 'static> Crud<Sqlite> for T {
                 operation: "delete".into(),
                 reason: "no key value".into(),
             })?;
-        let key_value = sqlite::Value::from(key_value);
-        let statement =
-            format!("DELETE FROM {table_name} WHERE {key_name} = :key_value RETURNING *");
-        let mut query = connection
-            .prepare(statement)
-            .map_err(|e| DomainError { inner: e })?;
-        query
-            .bind((":key_value", key_value))
-            .map_err(|e| DomainError { inner: e })?;
-        while let Ok(sqlite::State::Row) = query.next() {}
-
+        let statement = format!("DELETE FROM {table_name} WHERE {key_name} = ? RETURNING *");
+        let mut stream = bind_value(sqlx::query(&statement), key_value).fetch(connection);
+        // Drain RETURNING rows
+        while stream
+            .try_next()
+            .await
+            .map_err(DomainError::from)?
+            .is_some()
+        {}
         Ok(())
-    }
-
-    fn migration<S: 'static>() -> Migration<Sqlite>
-    where
-        Self: From<S>,
-    {
-        Migration {
-            table_name: Box::new(Self::table_name),
-            crud_fields: Box::new(Self::crud_fields),
-            from_prev: Box::new(|any: Box<dyn core::any::Any>| {
-                // SAFETY: we know we can downcast because of the Self: From<T> constraint
-                let t: Box<S> = any.downcast().unwrap();
-                let s = Self::from(*t);
-                Box::new(s)
-            }),
-            as_crud_fields: Box::new(|any: &Box<dyn core::any::Any>| {
-                if let Some(s) = any.downcast_ref::<Self>() {
-                    s.as_crud_fields()
-                } else {
-                    Default::default()
-                }
-            }),
-            try_from_crud_fields: Box::new(|fields| {
-                let s = Self::try_from_crud_fields(fields)?;
-                Ok(Box::new(s))
-            }),
-        }
     }
 }
 
@@ -380,32 +380,27 @@ impl CrudField {
     }
 }
 
-impl From<Value> for sqlite::Value {
-    fn from(value: Value) -> Self {
-        match value {
-            Value::Integer(i) => sqlite::Value::Integer(i),
-            Value::Float(i) => sqlite::Value::Float(i),
-            Value::String(i) => sqlite::Value::String(i),
-            Value::Bytes(i) => sqlite::Value::Binary(i),
-            Value::None => sqlite::Value::Null,
-        }
+/// Read a column out of a `SqliteRow` into a [`Value`].
+///
+/// Tries the column-typed decode paths in order to detect null vs typed value.
+fn row_to_value(row: &sqlx::sqlite::SqliteRow, name: &str) -> Value {
+    if let Ok(v) = row.try_get::<Option<i64>, _>(name) {
+        return v.map(Value::Integer).unwrap_or(Value::None);
     }
-}
-
-impl From<sqlite::Value> for Value {
-    fn from(value: sqlite::Value) -> Self {
-        match value {
-            sqlite::Value::Integer(i) => Value::Integer(i),
-            sqlite::Value::Float(i) => Value::Float(i),
-            sqlite::Value::String(i) => Value::String(i),
-            sqlite::Value::Binary(i) => Value::Bytes(i),
-            sqlite::Value::Null => Value::None,
-        }
+    if let Ok(v) = row.try_get::<Option<f64>, _>(name) {
+        return v.map(Value::Float).unwrap_or(Value::None);
     }
+    if let Ok(v) = row.try_get::<Option<String>, _>(name) {
+        return v.map(Value::String).unwrap_or(Value::None);
+    }
+    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(name) {
+        return v.map(Value::Bytes).unwrap_or(Value::None);
+    }
+    Value::None
 }
 
 impl MigrateEntireTable for Sqlite {
-    fn read_all_values<'a>(
+    async fn read_all_values<'a>(
         connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
         fields: Vec<CrudField>,
@@ -413,148 +408,68 @@ impl MigrateEntireTable for Sqlite {
         let column_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         let statement = format!("SELECT * FROM {table_name};");
 
-        // Attempt to prepare the statement. If the table doesn't exist, return empty results.
-        let query = match connection.prepare(&statement) {
-            Ok(q) => q,
-            Err(e)
-                if e.message
-                    .as_deref()
-                    .map(|m| m.contains("no such table"))
-                    .unwrap_or(false) =>
-            {
-                log::debug!("table {table_name} does not exist");
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(DomainError { inner: e }.into()),
-        };
+        // sqlx::query().fetch() returns a Stream directly (no Result). The "no such table"
+        // error surfaces on the first row poll, so handle it inside the loop.
+        let mut stream = sqlx::query(&statement).fetch(connection);
 
-        let cursor = query
-            .into_iter()
-            .map(
-                move |row| -> Result<HashMap<&str, Value>, Error<<Sqlite as CrudBackend>::Error>> {
-                    let row = row.map_err(|inner| DomainError { inner })?;
+        let mut cursor = Vec::new();
+        loop {
+            match stream.try_next().await {
+                Ok(Some(row)) => {
                     let mut cols = HashMap::default();
                     for name in column_names.iter() {
-                        let value = &row[*name];
-                        cols.insert(*name, value.clone().into());
+                        let v = row_to_value(&row, name);
+                        cols.insert(*name, v);
                     }
-                    Ok(cols)
-                },
-            )
-            .collect::<Vec<_>>();
+                    cursor.push(Ok(cols));
+                }
+                Ok(None) => break,
+                Err(sqlx::Error::Database(ref db_err))
+                    if db_err.message().contains("no such table") =>
+                {
+                    log::debug!("table {table_name} does not exist");
+                    return Ok(Vec::new());
+                }
+                Err(e) => return Err(DomainError { inner: e }.into()),
+            }
+        }
         Ok(cursor)
     }
 
-    fn insert_fields(
-        connection: &sqlite::Connection,
+    async fn insert_fields<'a>(
+        connection: &SqlitePool,
         table_name: &str,
         fields: &HashMap<&str, Value>,
     ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
-        let columns = fields.iter().map(|f| *f.0).collect::<Vec<_>>().join(", ");
-        let binds = fields
-            .iter()
-            .map(|f| format!(":{}", *f.0))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let statement = format!("INSERT INTO {table_name} ({columns}) VALUES ({binds});");
-        let mut query = connection
-            .prepare(&statement)
-            .map_err(|e| DomainError { inner: e })?;
-        for (key, value) in fields.iter() {
-            let key = format!(":{key}");
-            let k = key.as_str();
-            let value = sqlite::Value::from(value.clone());
-            query.bind((k, value)).map_err(DomainError::from)?;
+        let mut keys: Vec<&str> = fields.keys().copied().collect();
+        keys.sort_unstable();
+        let columns = keys.join(", ");
+        let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let statement = format!("INSERT INTO {table_name} ({columns}) VALUES ({placeholders});");
+        let mut query = sqlx::query(&statement);
+        for k in keys.iter() {
+            let v = fields.get(k).cloned().unwrap_or(Value::None);
+            query = bind_value(query, v);
         }
-
-        let state = query.next().map_err(DomainError::from)?;
-        if !matches!(state, sqlite::State::Done) {
+        let result = query.execute(connection).await.map_err(DomainError::from)?;
+        if result.rows_affected() == 0 {
             return Err(Error::OperationFailed {
-                operation: "insert".to_string(),
-                reason: "query not ok".to_string(),
+                operation: "insert".into(),
+                reason: "no rows inserted".into(),
             });
         }
         Ok(())
     }
 
-    fn delete_all(
-        connection: &sqlite::Connection,
+    async fn delete_all<'a>(
+        connection: &SqlitePool,
         table_name: &str,
     ) -> Result<(), Error<<Sqlite as CrudBackend>::Error>> {
         let statement = format!("DELETE FROM {table_name};");
-        let mut query = connection
-            .prepare(&statement)
-            .map_err(|e| DomainError { inner: e })?;
-        while query.next().is_ok() {}
+        sqlx::query(&statement)
+            .execute(connection)
+            .await
+            .map_err(DomainError::from)?;
         Ok(())
     }
-}
-
-pub fn try_from_row<T: Crud<Sqlite>>(
-    stmt: &sqlite::Statement<'_>,
-) -> Result<T, HasCrudFieldsError> {
-    let mut crud_fields = HashMap::default();
-    for field in T::crud_fields() {
-        crud_fields.insert(
-            field.name,
-            if field.nullable {
-                // For nullable fields, try to read as Option<T> to properly handle NULL
-                match field.ty {
-                    ValueType::Integer => {
-                        let val: Option<i64> = stmt.read(field.name).ok();
-                        Value::from(val)
-                    }
-                    ValueType::Float => {
-                        let val: Option<f64> = stmt.read(field.name).ok();
-                        Value::from(val)
-                    }
-                    ValueType::String => {
-                        let val: Option<String> = stmt.read(field.name).ok();
-                        Value::from(val)
-                    }
-                    ValueType::Bytes => {
-                        let val: Option<Vec<u8>> = stmt.read(field.name).ok();
-                        Value::from(val)
-                    }
-                }
-            } else {
-                // For non-nullable fields, read directly
-                match field.ty {
-                    ValueType::Integer => {
-                        Value::Integer(stmt.read(field.name).ok().ok_or_else(|| {
-                            HasCrudFieldsError {
-                                value: Value::None,
-                                reason: format!("could not read field {}", field.name),
-                            }
-                        })?)
-                    }
-                    ValueType::Float => {
-                        Value::Float(stmt.read(field.name).ok().ok_or_else(|| {
-                            HasCrudFieldsError {
-                                value: Value::None,
-                                reason: format!("could not read field {}", field.name),
-                            }
-                        })?)
-                    }
-                    ValueType::String => {
-                        Value::String(stmt.read(field.name).ok().ok_or_else(|| {
-                            HasCrudFieldsError {
-                                value: Value::None,
-                                reason: format!("could not read field {}", field.name),
-                            }
-                        })?)
-                    }
-                    ValueType::Bytes => {
-                        Value::Bytes(stmt.read(field.name).ok().ok_or_else(|| {
-                            HasCrudFieldsError {
-                                value: Value::None,
-                                reason: format!("could not read field {}", field.name),
-                            }
-                        })?)
-                    }
-                }
-            },
-        );
-    }
-    T::try_from_crud_fields(&crud_fields)
 }

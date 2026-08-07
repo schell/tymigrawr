@@ -15,8 +15,9 @@
 //!
 //! ## Usage Example
 //!
-//! ```rust
+//! ```rust,ignore
 //! use tymigrawr::{HasCrudFields, PrimaryKey, Crud, Migrations, Sqlite};
+//! use sqlx::SqlitePool;
 //!
 //! // Define version 1
 //! #[derive(Debug, Clone, HasCrudFields)]
@@ -44,24 +45,27 @@
 //!     }
 //! }
 //!
-//! // Create the backend connection
-//! let conn = sqlite::open(":memory:").unwrap();
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create the backend connection (a sqlx pool)
+//! let pool = SqlitePool::connect("sqlite::memory:").await?;
 //!
 //! // Use version 1
-//! <PlayerV1 as Crud<Sqlite>>::create(&conn).unwrap();
+//! <PlayerV1 as Crud<Sqlite>>::create(&pool).await?;
 //! let mut player = PlayerV1 {
 //!     id: PrimaryKey::new(1),
 //!     name: "Alice".to_string(),
 //! };
-//! <PlayerV1 as Crud<Sqlite>>::insert(&mut player, &conn).unwrap();
+//! <PlayerV1 as Crud<Sqlite>>::insert(&mut player, &pool).await?;
 //!
 //! // Use version 2
-//! <PlayerV2 as Crud<Sqlite>>::create(&conn).unwrap();
+//! <PlayerV2 as Crud<Sqlite>>::create(&pool).await?;
 //!
 //! // Run migrations
 //! let migrations = Migrations::<PlayerV1, Sqlite>::default()
 //!     .with_version::<PlayerV2>();
-//! migrations.run(&conn).unwrap();
+//! migrations.run(&pool).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 mod crud;
@@ -107,6 +111,7 @@ mod test {
         self as tymigrawr, AutoPrimaryKey, Crud, CrudBackend, HasCrudFields, JsonText,
         MigrateEntireTable, Migrations, PrimaryKey,
     };
+    use futures::StreamExt;
 
     #[derive(Debug, Clone, PartialEq, HasCrudFields)]
     pub struct PlayerV1 {
@@ -240,64 +245,80 @@ mod test {
         pub name: String,
     }
 
-    fn test_p1_crud<B: CrudBackend>(conn: B::Connection<'_>)
+    /// Pull exactly one item from a stream, unwrapping the outer Result and the row Result.
+    macro_rules! one {
+        ($stream:expr) => {{
+            let mut s = $stream;
+            s.next()
+                .await
+                .expect("stream ended unexpectedly")
+                .expect("row read failed")
+        }};
+    }
+
+    /// Collect all items from a stream into a Vec, unwrapping the outer Result and the row Result.
+    macro_rules! all {
+        ($stream:expr) => {{
+            let mut s = $stream;
+            let mut out = Vec::new();
+            while let Some(item) = s.next().await {
+                out.push(item.expect("row read failed"));
+            }
+            out
+        }};
+    }
+
+    async fn test_p1_crud<B: CrudBackend>(conn: B::Connection<'_>)
     where
         PlayerV1: Crud<B>,
     {
-        PlayerV1::create(conn).unwrap();
+        PlayerV1::create(conn).await.unwrap();
         let mut first_player = PlayerV1 {
             id: PrimaryKey::new(0),
             name: "tymigrawr".to_string(),
         };
-        first_player.insert(conn).unwrap();
-        let player = PlayerV1::read(conn, 0).unwrap().next().unwrap().unwrap();
+        first_player.insert(conn).await.unwrap();
+        let player = one!(PlayerV1::read(conn, 0).await.unwrap());
         assert_eq!(first_player, player);
         let mut second_player = PlayerV1 {
             id: PrimaryKey::new(1),
             name: "developer".to_string(),
         };
-        second_player.insert(conn).unwrap();
-        let player = PlayerV1::read(conn, 1).unwrap().next().unwrap().unwrap();
+        second_player.insert(conn).await.unwrap();
+        let player = one!(PlayerV1::read(conn, 1).await.unwrap());
         assert_eq!(second_player, player);
 
-        let mut p1 = PlayerV1::read(conn, first_player.id.inner).unwrap();
-        assert_eq!(first_player, p1.next().unwrap().unwrap());
-        let mut p2 = PlayerV1::read(conn, second_player.id.inner).unwrap();
-        assert_eq!(second_player, p2.next().unwrap().unwrap());
-
-        second_player.name = "software engineer".to_string();
-        PlayerV1::update(&second_player, conn).unwrap();
-        let p2 = PlayerV1::read(conn, second_player.id.inner)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let p1 = one!(PlayerV1::read(conn, first_player.id.inner).await.unwrap());
+        assert_eq!(first_player, p1);
+        let p2 = one!(PlayerV1::read(conn, second_player.id.inner).await.unwrap());
         assert_eq!(second_player, p2);
 
-        PlayerV1::delete(second_player, conn).unwrap();
-        let players = PlayerV1::read(conn, p2.id.inner)
-            .unwrap()
-            .map(|p| p.unwrap())
-            .collect::<Vec<_>>();
+        second_player.name = "software engineer".to_string();
+        PlayerV1::update(&second_player, conn).await.unwrap();
+        let p2 = one!(PlayerV1::read(conn, second_player.id.inner).await.unwrap());
+        assert_eq!(second_player, p2);
+
+        PlayerV1::delete(second_player, conn).await.unwrap();
+        let players = all!(PlayerV1::read(conn, p2.id.inner).await.unwrap());
         assert!(players.is_empty());
     }
 
-    fn test_upsert<B: CrudBackend>(conn: B::Connection<'_>)
+    async fn test_upsert<B: CrudBackend>(conn: B::Connection<'_>)
     where
         PlayerV1: Crud<B>,
     {
-        PlayerV1::create(conn).unwrap();
+        PlayerV1::create(conn).await.unwrap();
 
         // Upsert a new row — should insert and return true
         let mut player = PlayerV1 {
             id: PrimaryKey::new(42),
             name: "original".to_string(),
         };
-        let changed = player.upsert(conn).unwrap();
+        let changed = player.upsert(conn).await.unwrap();
         assert!(changed, "upsert of new row should return true");
 
         // Read it back
-        let from_db = PlayerV1::read(conn, 42).unwrap().next().unwrap().unwrap();
+        let from_db = one!(PlayerV1::read(conn, 42).await.unwrap());
         assert_eq!(player, from_db);
 
         // Upsert with same PK but different data — should update and return true
@@ -305,23 +326,23 @@ mod test {
             id: PrimaryKey::new(42),
             name: "updated".to_string(),
         };
-        let changed = updated.upsert(conn).unwrap();
+        let changed = updated.upsert(conn).await.unwrap();
         assert!(changed, "upsert of existing row should return true");
 
         // Read it back and verify update took effect
-        let from_db = PlayerV1::read(conn, 42).unwrap().next().unwrap().unwrap();
+        let from_db = one!(PlayerV1::read(conn, 42).await.unwrap());
         assert_eq!(updated, from_db);
 
         // Verify only one row exists with that key
-        let all = PlayerV1::read(conn, 42).unwrap().collect::<Vec<_>>();
+        let all = all!(PlayerV1::read(conn, 42).await.unwrap());
         assert_eq!(1, all.len(), "upsert should not duplicate rows");
     }
 
-    fn test_auto_increment_i64<B: CrudBackend>(conn: B::Connection<'_>)
+    async fn test_auto_increment_i64<B: CrudBackend>(conn: B::Connection<'_>)
     where
         AutoIncrementModel: Crud<B>,
     {
-        AutoIncrementModel::create(conn).unwrap();
+        AutoIncrementModel::create(conn).await.unwrap();
 
         // Verify that the id field has auto_increment enabled
         let crud_fields = <AutoIncrementModel as HasCrudFields>::crud_fields();
@@ -343,51 +364,47 @@ mod test {
             id: AutoPrimaryKey::default(),
             name: "first".to_string(),
         };
-        record1.insert(conn).unwrap();
+        record1.insert(conn).await.unwrap();
 
         let mut record2 = AutoIncrementModel {
             id: AutoPrimaryKey::default(),
             name: "second".to_string(),
         };
-        record2.insert(conn).unwrap();
+        record2.insert(conn).await.unwrap();
 
         let mut record3 = AutoIncrementModel {
             id: AutoPrimaryKey::default(),
             name: "third".to_string(),
         };
-        record3.insert(conn).unwrap();
+        record3.insert(conn).await.unwrap();
 
         // Verify all records were created with sequential IDs
-        let from_db_1 = <AutoIncrementModel as Crud<B>>::read(conn, 1)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db_1 = one!(<AutoIncrementModel as Crud<B>>::read(conn, 1)
+            .await
+            .unwrap());
         assert_eq!(from_db_1.name, "first");
         assert_eq!(from_db_1.id.inner, Some(1));
 
-        let from_db_2 = <AutoIncrementModel as Crud<B>>::read(conn, 2)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db_2 = one!(<AutoIncrementModel as Crud<B>>::read(conn, 2)
+            .await
+            .unwrap());
         assert_eq!(from_db_2.name, "second");
         assert_eq!(from_db_2.id.inner, Some(2));
 
-        let from_db_3 = <AutoIncrementModel as Crud<B>>::read(conn, 3)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db_3 = one!(<AutoIncrementModel as Crud<B>>::read(conn, 3)
+            .await
+            .unwrap());
         assert_eq!(from_db_3.name, "third");
         assert_eq!(from_db_3.id.inner, Some(3));
     }
 
-    fn test_auto_increment_i32<B: CrudBackend>(conn: B::Connection<'_>)
+    async fn test_auto_increment_i32<B: CrudBackend>(conn: B::Connection<'_>)
     where
         AutoIncrementModelI32: Crud<B>,
     {
-        <AutoIncrementModelI32 as Crud<B>>::create(conn).unwrap();
+        <AutoIncrementModelI32 as Crud<B>>::create(conn)
+            .await
+            .unwrap();
 
         // Verify that the id field has auto_increment enabled (i32 variant)
         let crud_fields = <AutoIncrementModelI32 as HasCrudFields>::crud_fields();
@@ -409,51 +426,45 @@ mod test {
             id: AutoPrimaryKey::default(),
             name: "first i32".to_string(),
         };
-        record1.insert(conn).unwrap();
+        record1.insert(conn).await.unwrap();
 
         let mut record2 = AutoIncrementModelI32 {
             id: AutoPrimaryKey::default(),
             name: "second i32".to_string(),
         };
-        record2.insert(conn).unwrap();
+        record2.insert(conn).await.unwrap();
 
         let mut record3 = AutoIncrementModelI32 {
             id: AutoPrimaryKey::default(),
             name: "third i32".to_string(),
         };
-        record3.insert(conn).unwrap();
+        record3.insert(conn).await.unwrap();
 
         // Verify all records were created with sequential IDs
-        let from_db_1 = <AutoIncrementModelI32 as Crud<B>>::read(conn, 1)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db_1 = one!(<AutoIncrementModelI32 as Crud<B>>::read(conn, 1)
+            .await
+            .unwrap());
         assert_eq!(from_db_1.name, "first i32");
         assert_eq!(from_db_1.id.inner, Some(1));
 
-        let from_db_2 = <AutoIncrementModelI32 as Crud<B>>::read(conn, 2)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db_2 = one!(<AutoIncrementModelI32 as Crud<B>>::read(conn, 2)
+            .await
+            .unwrap());
         assert_eq!(from_db_2.name, "second i32");
         assert_eq!(from_db_2.id.inner, Some(2));
 
-        let from_db_3 = <AutoIncrementModelI32 as Crud<B>>::read(conn, 3)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db_3 = one!(<AutoIncrementModelI32 as Crud<B>>::read(conn, 3)
+            .await
+            .unwrap());
         assert_eq!(from_db_3.name, "third i32");
         assert_eq!(from_db_3.id.inner, Some(3));
     }
 
-    fn test_auto_increment_u32<B: CrudBackend>(conn: B::Connection<'_>)
+    async fn test_auto_increment_u32<B: CrudBackend>(conn: B::Connection<'_>)
     where
         AutoIncrementModelU32: Crud<B>,
     {
-        AutoIncrementModelU32::create(conn).unwrap();
+        AutoIncrementModelU32::create(conn).await.unwrap();
 
         // Verify that the id field has auto_increment enabled (u32 variant)
         let crud_fields = <AutoIncrementModelU32 as HasCrudFields>::crud_fields();
@@ -475,51 +486,45 @@ mod test {
             id: AutoPrimaryKey::default(),
             name: "first u32".to_string(),
         };
-        record1.insert(conn).unwrap();
+        record1.insert(conn).await.unwrap();
 
         let mut record2 = AutoIncrementModelU32 {
             id: AutoPrimaryKey::default(),
             name: "second u32".to_string(),
         };
-        record2.insert(conn).unwrap();
+        record2.insert(conn).await.unwrap();
 
         let mut record3 = AutoIncrementModelU32 {
             id: AutoPrimaryKey::default(),
             name: "third u32".to_string(),
         };
-        record3.insert(conn).unwrap();
+        record3.insert(conn).await.unwrap();
 
         // Verify all records were created with sequential IDs
-        let from_db_1 = <AutoIncrementModelU32 as Crud<B>>::read(conn, 1)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db_1 = one!(<AutoIncrementModelU32 as Crud<B>>::read(conn, 1)
+            .await
+            .unwrap());
         assert_eq!(from_db_1.name, "first u32");
         assert_eq!(from_db_1.id.inner, Some(1));
 
-        let from_db_2 = <AutoIncrementModelU32 as Crud<B>>::read(conn, 2)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db_2 = one!(<AutoIncrementModelU32 as Crud<B>>::read(conn, 2)
+            .await
+            .unwrap());
         assert_eq!(from_db_2.name, "second u32");
         assert_eq!(from_db_2.id.inner, Some(2));
 
-        let from_db_3 = <AutoIncrementModelU32 as Crud<B>>::read(conn, 3)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db_3 = one!(<AutoIncrementModelU32 as Crud<B>>::read(conn, 3)
+            .await
+            .unwrap());
         assert_eq!(from_db_3.name, "third u32");
         assert_eq!(from_db_3.id.inner, Some(3));
     }
 
-    fn test_auto_increment_key_update<B: CrudBackend>(conn: B::Connection<'_>)
+    async fn test_auto_increment_key_update<B: CrudBackend>(conn: B::Connection<'_>)
     where
         AutoIncrementModel: Crud<B>,
     {
-        AutoIncrementModel::create(conn).unwrap();
+        AutoIncrementModel::create(conn).await.unwrap();
 
         // Test that insert() updates the AutoPrimaryKey value
         let mut record1 = AutoIncrementModel {
@@ -529,7 +534,7 @@ mod test {
         // Before insert, the id should be None
         assert_eq!(record1.id.inner, None, "id should be None before insert");
 
-        record1.insert(conn).unwrap();
+        record1.insert(conn).await.unwrap();
 
         // After insert, the id should be updated to Some(1)
         assert_eq!(
@@ -545,7 +550,7 @@ mod test {
         };
         assert_eq!(record2.id.inner, None, "id should be None before insert");
 
-        record2.insert(conn).unwrap();
+        record2.insert(conn).await.unwrap();
 
         assert_eq!(
             record2.id.inner,
@@ -560,7 +565,7 @@ mod test {
         };
         assert_eq!(record3.id.inner, None, "id should be None before upsert");
 
-        let changed = record3.upsert(conn).unwrap();
+        let changed = record3.upsert(conn).await.unwrap();
         assert!(changed, "upsert should return true for new record");
 
         assert_eq!(
@@ -571,7 +576,7 @@ mod test {
 
         // Verify upsert with existing key (should update, not create new)
         record3.name = "third updated".to_string();
-        let changed = record3.upsert(conn).unwrap();
+        let changed = record3.upsert(conn).await.unwrap();
         assert!(changed, "upsert should return true for updated record");
 
         // ID should remain the same
@@ -582,20 +587,18 @@ mod test {
         );
 
         // Verify from database that the name was updated
-        let from_db = <AutoIncrementModel as Crud<B>>::read(conn, 3)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db = one!(<AutoIncrementModel as Crud<B>>::read(conn, 3)
+            .await
+            .unwrap());
         assert_eq!(from_db.name, "third updated");
         assert_eq!(from_db.id.inner, Some(3));
     }
 
-    fn test_json_text<B: CrudBackend>(conn: B::Connection<'_>)
+    async fn test_json_text<B: CrudBackend>(conn: B::Connection<'_>)
     where
         Palette: Crud<B>,
     {
-        Palette::create(conn).unwrap();
+        Palette::create(conn).await.unwrap();
 
         // Insert a palette with colors and Some metadata
         let mut palette = Palette {
@@ -612,14 +615,10 @@ mod test {
             ]),
             metadata: Some(JsonText::new(vec!["warm".into(), "nature".into()])),
         };
-        palette.insert(conn).unwrap();
+        palette.insert(conn).await.unwrap();
 
         // Read it back and verify round-trip
-        let from_db = <Palette as Crud<B>>::read(conn, 1)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db = one!(<Palette as Crud<B>>::read(conn, 1).await.unwrap());
         assert_eq!(palette, from_db);
 
         // Insert a palette with None metadata
@@ -631,13 +630,9 @@ mod test {
             }]),
             metadata: None,
         };
-        palette_no_meta.insert(conn).unwrap();
+        palette_no_meta.insert(conn).await.unwrap();
 
-        let from_db = <Palette as Crud<B>>::read(conn, 2)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db = one!(<Palette as Crud<B>>::read(conn, 2).await.unwrap());
         assert_eq!(palette_no_meta, from_db);
 
         // Upsert the first palette with updated colors
@@ -649,55 +644,51 @@ mod test {
             }]),
             metadata: None,
         };
-        updated.upsert(conn).unwrap();
+        updated.upsert(conn).await.unwrap();
 
-        let from_db = <Palette as Crud<B>>::read(conn, 1)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let from_db = one!(<Palette as Crud<B>>::read(conn, 1).await.unwrap());
         assert_eq!(updated, from_db);
 
         // Verify read_all returns both palettes
-        let all = <Palette as Crud<B>>::read_all(conn)
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect::<Vec<_>>();
+        let all = all!(<Palette as Crud<B>>::read_all(conn).await.unwrap());
         assert_eq!(2, all.len());
     }
 
-    fn test_p2_crud<B: CrudBackend>(conn: B::Connection<'_>)
+    async fn test_p2_crud<B: CrudBackend>(conn: B::Connection<'_>)
     where
         PlayerV2: Crud<B>,
     {
-        <PlayerV2 as Crud<B>>::create(conn).unwrap();
+        <PlayerV2 as Crud<B>>::create(conn).await.unwrap();
         let mut first_player = PlayerV2 {
             id: PrimaryKey::new(0),
             name: "tymigrawr".to_string(),
             age: 0.1,
         };
-        first_player.insert(conn).unwrap();
-        let mut p1 = <PlayerV2 as Crud<B>>::read(conn, first_player.id.inner).unwrap();
-        assert_eq!(first_player, p1.next().unwrap().unwrap());
+        first_player.insert(conn).await.unwrap();
+        let p1 = one!(<PlayerV2 as Crud<B>>::read(conn, first_player.id.inner)
+            .await
+            .unwrap());
+        assert_eq!(first_player, p1);
 
         first_player.name = "software engineer".to_string();
-        <PlayerV2 as Crud<B>>::update(&first_player, conn).unwrap();
-        let p2 = <PlayerV2 as Crud<B>>::read(conn, first_player.id.inner)
-            .unwrap()
-            .next()
-            .unwrap()
+        <PlayerV2 as Crud<B>>::update(&first_player, conn)
+            .await
             .unwrap();
+        let p2 = one!(<PlayerV2 as Crud<B>>::read(conn, first_player.id.inner)
+            .await
+            .unwrap());
         assert_eq!(first_player, p2);
 
-        <PlayerV2 as Crud<B>>::delete(first_player, conn).unwrap();
-        let players = <PlayerV2 as Crud<B>>::read(conn, p2.id.inner)
-            .unwrap()
-            .map(|p| p.unwrap())
-            .collect::<Vec<_>>();
+        <PlayerV2 as Crud<B>>::delete(first_player, conn)
+            .await
+            .unwrap();
+        let players = all!(<PlayerV2 as Crud<B>>::read(conn, p2.id.inner)
+            .await
+            .unwrap());
         assert!(players.is_empty());
     }
 
-    fn test_migrate<'a, B: MigrateEntireTable>(
+    async fn test_migrate<'a, B: MigrateEntireTable>(
         mk_connection: impl Fn(&str) -> <B as CrudBackend>::Connection<'a>,
     ) where
         PlayerV1: Crud<B>,
@@ -707,9 +698,15 @@ mod test {
         let _ = env_logger::builder().is_test(true).try_init();
 
         log::debug!("creating tables");
-        <PlayerV1 as Crud<B>>::create((mk_connection)("playerv1")).unwrap();
-        <PlayerV2 as Crud<B>>::create((mk_connection)("playerv2")).unwrap();
-        <PlayerV3 as Crud<B>>::create((mk_connection)("playerv3")).unwrap();
+        <PlayerV1 as Crud<B>>::create((mk_connection)("playerv1"))
+            .await
+            .unwrap();
+        <PlayerV2 as Crud<B>>::create((mk_connection)("playerv2"))
+            .await
+            .unwrap();
+        <PlayerV3 as Crud<B>>::create((mk_connection)("playerv3"))
+            .await
+            .unwrap();
 
         log::debug!("populating v1");
         let mut players_v1 = (0..100)
@@ -719,7 +716,7 @@ mod test {
             })
             .collect::<Vec<_>>();
         for player in players_v1.iter_mut() {
-            player.insert((mk_connection)("playerv1")).unwrap();
+            player.insert((mk_connection)("playerv1")).await.unwrap();
         }
         let players_v3 = players_v1
             .iter()
@@ -732,34 +729,31 @@ mod test {
         let migrations = Migrations::<PlayerV1, B>::default()
             .with_version::<PlayerV2>()
             .with_version::<Player>();
-        migrations.run_with(&mk_connection).unwrap();
+        migrations.run_with(&mk_connection).await.unwrap();
 
-        let players_v1_from_db = <PlayerV1 as Crud<B>>::read_all((mk_connection)("playerv1"))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect::<Vec<_>>();
+        let players_v1_from_db = all!(<PlayerV1 as Crud<B>>::read_all((mk_connection)("playerv1"))
+            .await
+            .unwrap());
         assert_eq!(Vec::<PlayerV1>::new(), players_v1_from_db);
 
-        let players_v3_from_db = <PlayerV3 as Crud<B>>::read_all((mk_connection)("playerv3"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>();
+        let players_v3_from_db = all!(<PlayerV3 as Crud<B>>::read_all((mk_connection)("playerv3"))
+            .await
+            .unwrap());
         assert_eq!(players_v3, players_v3_from_db);
 
         log::debug!("running reverse migrations");
         let migrations = Migrations::<Player, B>::default()
             .with_version::<PlayerV2>()
             .with_version::<PlayerV1>();
-        migrations.run_with(&mk_connection).unwrap();
+        migrations.run_with(&mk_connection).await.unwrap();
 
-        let players_v1_from_db = <PlayerV1 as Crud<B>>::read_all((mk_connection)("playerv1"))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect::<Vec<_>>();
+        let players_v1_from_db = all!(<PlayerV1 as Crud<B>>::read_all((mk_connection)("playerv1"))
+            .await
+            .unwrap());
         assert_eq!(players_v1, players_v1_from_db);
     }
 
-    fn test_migrate_4_versions<'a, B: MigrateEntireTable>(
+    async fn test_migrate_4_versions<'a, B: MigrateEntireTable>(
         scenario: &str,
         conn: <B as CrudBackend>::Connection<'a>,
     ) where
@@ -783,7 +777,7 @@ mod test {
                 // Scenario A: Only V1 table exists
                 log::debug!("Scenario A: Only V1 table exists");
                 // Create the source table for test data insertion
-                <PlayerV1 as Crud<B>>::create(conn).unwrap();
+                <PlayerV1 as Crud<B>>::create(conn).await.unwrap();
 
                 let mut players_v1 = (0..test_data_count)
                     .map(|i| PlayerV1 {
@@ -793,7 +787,7 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v1.iter_mut() {
-                    player.insert(conn).unwrap();
+                    player.insert(conn).await.unwrap();
                 }
 
                 // Expected final data in V4
@@ -811,13 +805,10 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(mk_connection).unwrap();
+                migrations.run_with(mk_connection).await.unwrap();
 
                 // Verify V1 table is empty
-                let v1_remaining = <PlayerV1 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v1_remaining = all!(<PlayerV1 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     Vec::<PlayerV1>::new(),
                     v1_remaining,
@@ -825,10 +816,7 @@ mod test {
                 );
 
                 // Verify V4 table has all data
-                let v4_data = <PlayerV4 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v4_data = all!(<PlayerV4 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     expected_v4, v4_data,
                     "V4 table should contain all migrated data"
@@ -839,7 +827,7 @@ mod test {
                 // Scenario B: Only V2 table exists
                 log::debug!("Scenario B: Only V2 table exists");
                 // Create the source table for test data insertion
-                <PlayerV2 as Crud<B>>::create(conn).unwrap();
+                <PlayerV2 as Crud<B>>::create(conn).await.unwrap();
 
                 let mut players_v2 = (0..test_data_count)
                     .map(|i| PlayerV2 {
@@ -850,7 +838,7 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v2.iter_mut() {
-                    player.insert(conn).unwrap();
+                    player.insert(conn).await.unwrap();
                 }
 
                 // Expected final data in V4
@@ -867,13 +855,10 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(mk_connection).unwrap();
+                migrations.run_with(mk_connection).await.unwrap();
 
                 // Verify V2 table is empty
-                let v2_remaining = <PlayerV2 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v2_remaining = all!(<PlayerV2 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     Vec::<PlayerV2>::new(),
                     v2_remaining,
@@ -881,10 +866,7 @@ mod test {
                 );
 
                 // Verify V4 table has all data
-                let v4_data = <PlayerV4 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v4_data = all!(<PlayerV4 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     expected_v4, v4_data,
                     "V4 table should contain all migrated data"
@@ -895,7 +877,7 @@ mod test {
                 // Scenario C: Only V3 table exists
                 log::debug!("Scenario C: Only V3 table exists");
                 // Create the source table for test data insertion
-                <PlayerV3 as Crud<B>>::create(conn).unwrap();
+                <PlayerV3 as Crud<B>>::create(conn).await.unwrap();
 
                 let mut players_v3 = (0..test_data_count)
                     .map(|i| PlayerV3 {
@@ -906,7 +888,7 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v3.iter_mut() {
-                    player.insert(conn).unwrap();
+                    player.insert(conn).await.unwrap();
                 }
 
                 // Expected final data in V4
@@ -922,13 +904,10 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(mk_connection).unwrap();
+                migrations.run_with(mk_connection).await.unwrap();
 
                 // Verify V3 table is empty
-                let v3_remaining = <PlayerV3 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v3_remaining = all!(<PlayerV3 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     Vec::<PlayerV3>::new(),
                     v3_remaining,
@@ -936,10 +915,7 @@ mod test {
                 );
 
                 // Verify V4 table has all data
-                let v4_data = <PlayerV4 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v4_data = all!(<PlayerV4 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     expected_v4, v4_data,
                     "V4 table should contain all migrated data"
@@ -950,7 +926,7 @@ mod test {
                 // Scenario D: Only V4 table exists (no migration needed)
                 log::debug!("Scenario D: Only V4 table exists");
                 // Create the source table for test data insertion
-                <PlayerV4 as Crud<B>>::create(conn).unwrap();
+                <PlayerV4 as Crud<B>>::create(conn).await.unwrap();
 
                 let mut players_v4 = (0..test_data_count)
                     .map(|i| PlayerV4 {
@@ -962,7 +938,7 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v4.iter_mut() {
-                    player.insert(conn).unwrap();
+                    player.insert(conn).await.unwrap();
                 }
 
                 // Run migration chain V1 -> V4
@@ -971,13 +947,10 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(mk_connection).unwrap();
+                migrations.run_with(mk_connection).await.unwrap();
 
                 // Verify V4 table still has all data
-                let v4_data = PlayerV4::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v4_data = all!(PlayerV4::read_all(conn).await.unwrap());
                 assert_eq!(
                     players_v4, v4_data,
                     "V4 table should remain unchanged when it's the only table"
@@ -988,8 +961,8 @@ mod test {
                 // Scenario E: Both V1 and V3 tables exist
                 log::debug!("Scenario E: Both V1 and V3 tables exist");
                 // Create the source tables for test data insertion
-                <PlayerV1 as Crud<B>>::create(conn).unwrap();
-                <PlayerV3 as Crud<B>>::create(conn).unwrap();
+                <PlayerV1 as Crud<B>>::create(conn).await.unwrap();
+                <PlayerV3 as Crud<B>>::create(conn).await.unwrap();
 
                 let mut players_v1 = (0..5)
                     .map(|i| PlayerV1 {
@@ -1007,10 +980,10 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v1.iter_mut() {
-                    player.insert(conn).unwrap();
+                    player.insert(conn).await.unwrap();
                 }
                 for player in players_v3.iter_mut() {
-                    player.insert(conn).unwrap();
+                    player.insert(conn).await.unwrap();
                 }
 
                 // Expected final data in V4 (both sources converted)
@@ -1037,23 +1010,17 @@ mod test {
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV4>();
-                migrations.run_with(mk_connection).unwrap();
+                migrations.run_with(mk_connection).await.unwrap();
 
                 // Verify V1 and V3 tables are empty
-                let v1_remaining = <PlayerV1 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v1_remaining = all!(<PlayerV1 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     Vec::<PlayerV1>::new(),
                     v1_remaining,
                     "V1 table should be empty after migration"
                 );
 
-                let v3_remaining = <PlayerV3 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v3_remaining = all!(<PlayerV3 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     Vec::<PlayerV3>::new(),
                     v3_remaining,
@@ -1061,10 +1028,7 @@ mod test {
                 );
 
                 // Verify V4 table has all data from both sources
-                let mut v4_data = <PlayerV4 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let mut v4_data = all!(<PlayerV4 as Crud<B>>::read_all(conn).await.unwrap());
                 v4_data.sort_by_key(|p| p.id.inner);
 
                 assert_eq!(
@@ -1077,7 +1041,7 @@ mod test {
                 // Scenario F: Reverse migration (V4 -> V1)
                 log::debug!("Scenario F: Reverse migration V4 -> V1");
                 // Create the source table for test data insertion
-                <PlayerV4 as Crud<B>>::create(conn).unwrap();
+                <PlayerV4 as Crud<B>>::create(conn).await.unwrap();
 
                 let mut players_v4 = (0..test_data_count)
                     .map(|i| PlayerV4 {
@@ -1089,7 +1053,7 @@ mod test {
                     .collect::<Vec<_>>();
 
                 for player in players_v4.iter_mut() {
-                    player.insert(conn).unwrap();
+                    player.insert(conn).await.unwrap();
                 }
 
                 // Expected final data in V1 (reverse converted)
@@ -1107,13 +1071,10 @@ mod test {
                     .with_version::<PlayerV3>()
                     .with_version::<PlayerV2>()
                     .with_version::<PlayerV1>();
-                migrations.run_with(mk_connection).unwrap();
+                migrations.run_with(mk_connection).await.unwrap();
 
                 // Verify V4 table is empty
-                let v4_remaining = <PlayerV4 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v4_remaining = all!(<PlayerV4 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     Vec::<PlayerV4>::new(),
                     v4_remaining,
@@ -1121,10 +1082,7 @@ mod test {
                 );
 
                 // Verify V1 table has all data
-                let v1_data = <PlayerV1 as Crud<B>>::read_all(conn)
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect::<Vec<_>>();
+                let v1_data = all!(<PlayerV1 as Crud<B>>::read_all(conn).await.unwrap());
                 assert_eq!(
                     expected_v1, v1_data,
                     "V1 table should contain all reverse-migrated data"
@@ -1139,44 +1097,50 @@ mod test {
 
     #[cfg(feature = "backend_sqlite")]
     mod sqlite_tests {
-        use super::{test_p1_crud, SettingsV1};
-        use crate::{
-            test::{
-                test_auto_increment_i32, test_auto_increment_i64, test_auto_increment_key_update,
-                test_auto_increment_u32, test_json_text, test_migrate, test_migrate_4_versions,
-                test_p2_crud, test_upsert,
-            },
-            Crud, PrimaryKey, Sqlite,
+        use super::{
+            test_auto_increment_i32, test_auto_increment_i64, test_auto_increment_key_update,
+            test_auto_increment_u32, test_json_text, test_migrate, test_migrate_4_versions,
+            test_p1_crud, test_p2_crud, test_upsert, SettingsV1,
         };
+        use crate::{Crud, PrimaryKey, Sqlite};
+        use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 
-        #[test]
-        fn p1_crud() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_p1_crud::<Sqlite>(&conn);
+        async fn pool() -> SqlitePool {
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap()
         }
 
-        #[test]
-        fn p2_crud() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_p2_crud::<Sqlite>(&conn);
+        #[tokio::test]
+        async fn p1_crud() {
+            let pool = pool().await;
+            test_p1_crud::<Sqlite>(&pool).await;
         }
 
-        #[test]
-        fn upsert() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_upsert::<Sqlite>(&conn);
+        #[tokio::test]
+        async fn p2_crud() {
+            let pool = pool().await;
+            test_p2_crud::<Sqlite>(&pool).await;
         }
 
-        #[test]
-        fn json_text() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_json_text::<Sqlite>(&conn);
+        #[tokio::test]
+        async fn upsert() {
+            let pool = pool().await;
+            test_upsert::<Sqlite>(&pool).await;
         }
 
-        #[test]
-        fn try_from_row_with_nullable_fields() {
-            let conn = sqlite::open(":memory:").unwrap();
-            <SettingsV1 as Crud<Sqlite>>::create(&conn).unwrap();
+        #[tokio::test]
+        async fn json_text() {
+            let pool = pool().await;
+            test_json_text::<Sqlite>(&pool).await;
+        }
+
+        #[tokio::test]
+        async fn read_with_nullable_fields() {
+            let pool = pool().await;
+            <SettingsV1 as Crud<Sqlite>>::create(&pool).await.unwrap();
 
             // Insert a row with NULL Option fields
             let mut settings = SettingsV1 {
@@ -1185,14 +1149,19 @@ mod test {
                 token: None,
                 timeout_secs: 60,
             };
-            <SettingsV1 as Crud<Sqlite>>::insert(&mut settings, &conn).unwrap();
-
-            // Now try to read it back using try_from_row
-            let mut stmt = conn
-                .prepare("SELECT * FROM settingsv1 WHERE id = 1")
+            <SettingsV1 as Crud<Sqlite>>::insert(&mut settings, &pool)
+                .await
                 .unwrap();
-            assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
-            let loaded = crate::try_from_row::<SettingsV1>(&stmt).unwrap();
+
+            // Read it back via the async Crud API
+            let loaded = {
+                use futures::StreamExt;
+                let mut s = <SettingsV1 as Crud<Sqlite>>::read(&pool, 1).await.unwrap();
+                s.next()
+                    .await
+                    .expect("stream ended")
+                    .expect("row read failed")
+            };
             assert_eq!(settings, loaded);
 
             // Insert another row with Some values
@@ -1202,14 +1171,19 @@ mod test {
                 token: Some("auth-token".to_string()),
                 timeout_secs: 120,
             };
-            <SettingsV1 as Crud<Sqlite>>::insert(&mut settings2, &conn).unwrap();
-
-            let mut stmt = conn
-                .prepare("SELECT * FROM settingsv1 WHERE id = 2")
+            <SettingsV1 as Crud<Sqlite>>::insert(&mut settings2, &pool)
+                .await
                 .unwrap();
-            assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
-            let loaded = crate::try_from_row::<SettingsV1>(&stmt).unwrap();
-            assert_eq!(settings2, loaded);
+
+            let loaded2 = {
+                use futures::StreamExt;
+                let mut s = <SettingsV1 as Crud<Sqlite>>::read(&pool, 2).await.unwrap();
+                s.next()
+                    .await
+                    .expect("stream ended")
+                    .expect("row read failed")
+            };
+            assert_eq!(settings2, loaded2);
 
             // Insert row with mixed Some/None
             let mut settings3 = SettingsV1 {
@@ -1218,87 +1192,108 @@ mod test {
                 token: None,
                 timeout_secs: 90,
             };
-            <SettingsV1 as Crud<Sqlite>>::insert(&mut settings3, &conn).unwrap();
-
-            let mut stmt = conn
-                .prepare("SELECT * FROM settingsv1 WHERE id = 3")
+            <SettingsV1 as Crud<Sqlite>>::insert(&mut settings3, &pool)
+                .await
                 .unwrap();
-            assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
-            let loaded = crate::try_from_row::<SettingsV1>(&stmt).unwrap();
-            assert_eq!(settings3, loaded);
+
+            let loaded3 = {
+                use futures::StreamExt;
+                let mut s = <SettingsV1 as Crud<Sqlite>>::read(&pool, 3).await.unwrap();
+                s.next()
+                    .await
+                    .expect("stream ended")
+                    .expect("row read failed")
+            };
+            assert_eq!(settings3, loaded3);
         }
 
-        #[test]
-        fn auto_increment_i64() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_auto_increment_i64::<Sqlite>(&conn);
+        #[tokio::test]
+        async fn auto_increment_i64() {
+            let pool = pool().await;
+            test_auto_increment_i64::<Sqlite>(&pool).await;
         }
 
-        #[test]
-        fn auto_increment_i32() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_auto_increment_i32::<Sqlite>(&conn);
+        #[tokio::test]
+        async fn auto_increment_i32() {
+            let pool = pool().await;
+            test_auto_increment_i32::<Sqlite>(&pool).await;
         }
 
-        #[test]
-        fn auto_increment_u32() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_auto_increment_u32::<Sqlite>(&conn);
+        #[tokio::test]
+        async fn auto_increment_u32() {
+            let pool = pool().await;
+            test_auto_increment_u32::<Sqlite>(&pool).await;
         }
 
-        #[test]
-        fn auto_increment_key_update() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_auto_increment_key_update::<Sqlite>(&conn);
+        #[tokio::test]
+        async fn auto_increment_key_update() {
+            let pool = pool().await;
+            test_auto_increment_key_update::<Sqlite>(&pool).await;
         }
 
-        #[test]
-        fn migrate() {
+        #[tokio::test]
+        async fn migrate() {
+            // Use a shared on-disk database for V1/V2 and a separate file for V3.
             let tempdir = tempfile::tempdir().unwrap();
-            let path = tempdir.path().join("data.db");
-            let connection = sqlite::open(path).unwrap();
-            let path = tempdir.path().join("data_v3.db");
-            let connection_v3 = sqlite::open(path).unwrap();
+            let url = format!(
+                "sqlite://{}?mode=rwc",
+                tempdir.path().join("data.db").display()
+            );
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap();
+            let url_v3 = format!(
+                "sqlite://{}?mode=rwc",
+                tempdir.path().join("data_v3.db").display()
+            );
+            let pool_v3 = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&url_v3)
+                .await
+                .unwrap();
             test_migrate::<Sqlite>(|table| match table {
-                "playerv3" => &connection_v3,
-                _ => &connection,
-            });
+                "playerv3" => &pool_v3,
+                _ => &pool,
+            })
+            .await;
         }
 
-        #[test]
-        fn migrate_4_versions_v1_only() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_migrate_4_versions::<Sqlite>("v1_only", &conn);
+        #[tokio::test]
+        async fn migrate_4_versions_v1_only() {
+            let pool = pool().await;
+            test_migrate_4_versions::<Sqlite>("v1_only", &pool).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v2_only() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_migrate_4_versions::<Sqlite>("v2_only", &conn);
+        #[tokio::test]
+        async fn migrate_4_versions_v2_only() {
+            let pool = pool().await;
+            test_migrate_4_versions::<Sqlite>("v2_only", &pool).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v3_only() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_migrate_4_versions::<Sqlite>("v3_only", &conn);
+        #[tokio::test]
+        async fn migrate_4_versions_v3_only() {
+            let pool = pool().await;
+            test_migrate_4_versions::<Sqlite>("v3_only", &pool).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v4_only() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_migrate_4_versions::<Sqlite>("v4_only", &conn);
+        #[tokio::test]
+        async fn migrate_4_versions_v4_only() {
+            let pool = pool().await;
+            test_migrate_4_versions::<Sqlite>("v4_only", &pool).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v1_v3_mix() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_migrate_4_versions::<Sqlite>("v1_v3_mix", &conn);
+        #[tokio::test]
+        async fn migrate_4_versions_v1_v3_mix() {
+            let pool = pool().await;
+            test_migrate_4_versions::<Sqlite>("v1_v3_mix", &pool).await;
         }
 
-        #[test]
-        fn migrate_4_versions_reverse() {
-            let conn = sqlite::open(":memory:").unwrap();
-            test_migrate_4_versions::<Sqlite>("reverse", &conn);
+        #[tokio::test]
+        async fn migrate_4_versions_reverse() {
+            let pool = pool().await;
+            test_migrate_4_versions::<Sqlite>("reverse", &pool).await;
         }
     }
 
@@ -1311,56 +1306,56 @@ mod test {
             rusqlite::Connection::open_in_memory().unwrap()
         }
 
-        #[test]
-        fn p1_crud() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn p1_crud() {
             let conn = open_in_memory();
-            test_p1_crud::<Doltlite>(&conn);
+            test_p1_crud::<Doltlite>(&conn).await;
         }
 
-        #[test]
-        fn p2_crud() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn p2_crud() {
             let conn = open_in_memory();
-            test_p2_crud::<Doltlite>(&conn);
+            test_p2_crud::<Doltlite>(&conn).await;
         }
 
-        #[test]
-        fn upsert() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn upsert() {
             let conn = open_in_memory();
-            test_upsert::<Doltlite>(&conn);
+            test_upsert::<Doltlite>(&conn).await;
         }
 
-        #[test]
-        fn json_text() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn json_text() {
             let conn = open_in_memory();
-            test_json_text::<Doltlite>(&conn);
+            test_json_text::<Doltlite>(&conn).await;
         }
 
-        #[test]
-        fn auto_increment_i64() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auto_increment_i64() {
             let conn = open_in_memory();
-            test_auto_increment_i64::<Doltlite>(&conn);
+            test_auto_increment_i64::<Doltlite>(&conn).await;
         }
 
-        #[test]
-        fn auto_increment_i32() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auto_increment_i32() {
             let conn = open_in_memory();
-            test_auto_increment_i32::<Doltlite>(&conn);
+            test_auto_increment_i32::<Doltlite>(&conn).await;
         }
 
-        #[test]
-        fn auto_increment_u32() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auto_increment_u32() {
             let conn = open_in_memory();
-            test_auto_increment_u32::<Doltlite>(&conn);
+            test_auto_increment_u32::<Doltlite>(&conn).await;
         }
 
-        #[test]
-        fn auto_increment_key_update() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn auto_increment_key_update() {
             let conn = open_in_memory();
-            test_auto_increment_key_update::<Doltlite>(&conn);
+            test_auto_increment_key_update::<Doltlite>(&conn).await;
         }
 
-        #[test]
-        fn migrate() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn migrate() {
             let tempdir = tempfile::tempdir().unwrap();
             let path = tempdir.path().join("data.db");
             let connection = rusqlite::Connection::open(&path).unwrap();
@@ -1369,43 +1364,44 @@ mod test {
             test_migrate::<Doltlite>(|table| match table {
                 "playerv3" => &connection_v3,
                 _ => &connection,
-            });
+            })
+            .await;
         }
 
-        #[test]
-        fn migrate_4_versions_v1_only() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn migrate_4_versions_v1_only() {
             let conn = open_in_memory();
-            test_migrate_4_versions::<Doltlite>("v1_only", &conn);
+            test_migrate_4_versions::<Doltlite>("v1_only", &conn).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v2_only() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn migrate_4_versions_v2_only() {
             let conn = open_in_memory();
-            test_migrate_4_versions::<Doltlite>("v2_only", &conn);
+            test_migrate_4_versions::<Doltlite>("v2_only", &conn).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v3_only() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn migrate_4_versions_v3_only() {
             let conn = open_in_memory();
-            test_migrate_4_versions::<Doltlite>("v3_only", &conn);
+            test_migrate_4_versions::<Doltlite>("v3_only", &conn).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v4_only() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn migrate_4_versions_v4_only() {
             let conn = open_in_memory();
-            test_migrate_4_versions::<Doltlite>("v4_only", &conn);
+            test_migrate_4_versions::<Doltlite>("v4_only", &conn).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v1_v3_mix() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn migrate_4_versions_v1_v3_mix() {
             let conn = open_in_memory();
-            test_migrate_4_versions::<Doltlite>("v1_v3_mix", &conn);
+            test_migrate_4_versions::<Doltlite>("v1_v3_mix", &conn).await;
         }
 
-        #[test]
-        fn migrate_4_versions_reverse() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn migrate_4_versions_reverse() {
             let conn = open_in_memory();
-            test_migrate_4_versions::<Doltlite>("reverse", &conn);
+            test_migrate_4_versions::<Doltlite>("reverse", &conn).await;
         }
     }
 
@@ -1414,77 +1410,78 @@ mod test {
         use super::*;
         use crate::Toml;
 
-        #[test]
-        fn p1_crud() {
+        #[tokio::test]
+        async fn p1_crud() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_p1_crud::<Toml>(tempdir.path());
+            test_p1_crud::<Toml>(tempdir.path()).await;
         }
 
-        #[test]
-        fn p2_crud() {
+        #[tokio::test]
+        async fn p2_crud() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_p2_crud::<Toml>(tempdir.path());
+            test_p2_crud::<Toml>(tempdir.path()).await;
         }
 
-        #[test]
-        fn upsert() {
+        #[tokio::test]
+        async fn upsert() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_upsert::<Toml>(tempdir.path());
+            test_upsert::<Toml>(tempdir.path()).await;
         }
 
-        #[test]
-        fn json_text() {
+        #[tokio::test]
+        async fn json_text() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_json_text::<Toml>(tempdir.path());
+            test_json_text::<Toml>(tempdir.path()).await;
         }
 
-        #[test]
-        fn migrate() {
+        #[tokio::test]
+        async fn migrate() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate::<Toml>(|_| tempdir.path());
+            test_migrate::<Toml>(|_| tempdir.path()).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v1_only() {
+        #[tokio::test]
+        async fn migrate_4_versions_v1_only() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v1_only", tempdir.path());
+            test_migrate_4_versions::<Toml>("v1_only", tempdir.path()).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v2_only() {
+        #[tokio::test]
+        async fn migrate_4_versions_v2_only() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v2_only", tempdir.path());
+            test_migrate_4_versions::<Toml>("v2_only", tempdir.path()).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v3_only() {
+        #[tokio::test]
+        async fn migrate_4_versions_v3_only() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v3_only", tempdir.path());
+            test_migrate_4_versions::<Toml>("v3_only", tempdir.path()).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v4_only() {
+        #[tokio::test]
+        async fn migrate_4_versions_v4_only() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v4_only", tempdir.path());
+            test_migrate_4_versions::<Toml>("v4_only", tempdir.path()).await;
         }
 
-        #[test]
-        fn migrate_4_versions_v1_v3_mix() {
+        #[tokio::test]
+        async fn migrate_4_versions_v1_v3_mix() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("v1_v3_mix", tempdir.path());
+            test_migrate_4_versions::<Toml>("v1_v3_mix", tempdir.path()).await;
         }
 
-        #[test]
-        fn migrate_4_versions_reverse() {
+        #[tokio::test]
+        async fn migrate_4_versions_reverse() {
             let tempdir = tempfile::tempdir().unwrap();
-            test_migrate_4_versions::<Toml>("reverse", tempdir.path());
+            test_migrate_4_versions::<Toml>("reverse", tempdir.path()).await;
         }
     }
 
     #[cfg(feature = "backend_sqlite")]
-    #[test]
-    fn module_docs() {
-        use crate::{Crud, HasCrudFields, PrimaryKey, Sqlite};
+    #[tokio::test]
+    async fn module_docs() {
+        use crate::{Crud, CrudBackend, HasCrudFields, PrimaryKey, Sqlite};
+        use sqlx::SqlitePool;
 
         /// Define a business type that can be persisted.
         #[derive(Debug, Clone, HasCrudFields)]
@@ -1494,25 +1491,25 @@ mod test {
         }
 
         /// For the most part, business logic involving persistance can be generic over the backend.
-        fn run<'a, Backend: CrudBackend>(
+        async fn run<'a, Backend: CrudBackend>(
             conn: Backend::Connection<'a>,
         ) -> Result<(), tymigrawr::Error<Backend::Error>>
         where
             User: Crud<Backend>,
         {
             // Create table
-            User::create(conn)?;
+            User::create(conn).await?;
 
             // Insert
             let mut user = User {
                 id: PrimaryKey::new(1),
                 name: "Alice".to_string(),
             };
-            user.insert(conn)?;
+            user.insert(conn).await?;
 
             // Read
-            let users = User::read_all(conn)?;
-            for result in users {
+            let mut users = User::read_all(conn).await?;
+            while let Some(result) = users.next().await {
                 let user = result?;
                 println!("{}", user.name);
             }
@@ -1521,7 +1518,7 @@ mod test {
         }
 
         // Then specialize on the backend at the edges of your application
-        let conn = sqlite::open(":memory:").unwrap();
-        run::<Sqlite>(&conn).unwrap();
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        run::<Sqlite>(&pool).await.unwrap();
     }
 }

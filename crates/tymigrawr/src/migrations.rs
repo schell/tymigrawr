@@ -50,21 +50,21 @@ pub trait MigrateEntireTable: CrudBackend {
     ///
     /// Errors should only be returned for actual backend failures (I/O errors, corruption, etc.),
     /// not for missing tables.
-    fn read_all_values<'a>(
+    async fn read_all_values<'a>(
         connection: <Self as CrudBackend>::Connection<'a>,
         table_name: &'a str,
         fields: Vec<CrudField>,
     ) -> TymResult<Vec<ReadAllValuesResult<'a, Self::Error>>, Self::Error>;
 
     /// Inserts a row (represented as a field map) into the specified table.
-    fn insert_fields(
+    async fn insert_fields(
         connection: <Self as CrudBackend>::Connection<'_>,
         table_name: &str,
         fields: &HashMap<&str, Value>,
     ) -> TymResult<(), Self::Error>;
 
     /// Deletes all rows from the specified table.
-    fn delete_all(
+    async fn delete_all(
         connection: <Self as CrudBackend>::Connection<'_>,
         table_name: &str,
     ) -> TymResult<(), Self::Error>;
@@ -80,7 +80,7 @@ pub trait MigrateEntireTable: CrudBackend {
 /// 1. Start with `Migrations::<V1, Backend>::default()` (which initializes with version V1).
 /// 2. Chain `.with_version::<V2>()` to add V2 (requires `impl From<V1> for V2`).
 /// 3. Optionally chain more versions: `.with_version::<V3>()`, etc.
-/// 4. Call `.run(&connection)` or `.run_with(|table| ...)` to execute all migrations.
+/// 4. Call `.run(&connection).await` or `.run_with(|table| ...).await` to execute all migrations.
 ///
 /// During execution:
 /// - For each old version table found in the database, all rows are read.
@@ -95,13 +95,13 @@ pub trait MigrateEntireTable: CrudBackend {
 /// let migrations = Migrations::<PlayerV1, Sqlite>::default()
 ///     .with_version::<PlayerV2>()
 ///     .with_version::<PlayerV3>();
-/// migrations.run(&conn).unwrap();
+/// migrations.run(&pool).await.unwrap();
 ///
 /// // Reverse migration (V3 → V2 → V1)
 /// let migrations = Migrations::<PlayerV3, Sqlite>::default()
 ///     .with_version::<PlayerV2>()
 ///     .with_version::<PlayerV1>();
-/// migrations.run(&conn).unwrap();
+/// migrations.run(&pool).await.unwrap();
 /// ```
 pub struct Migrations<T, Backend: CrudBackend> {
     _current: PhantomData<(T, Backend)>,
@@ -157,11 +157,11 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
     /// # Errors
     ///
     /// Returns an error if any database operation fails (reading, inserting, or deleting rows).
-    pub fn run<'a>(
+    pub async fn run<'a>(
         self,
         connection: <Backend as CrudBackend>::Connection<'a>,
     ) -> TymResult<(), Backend::Error> {
-        self.run_with(|_| connection)
+        self.run_with(|_| connection).await
     }
 
     /// Executes all queued migrations using a closure to get connections per table.
@@ -175,7 +175,7 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
     /// # Errors
     ///
     /// Returns an error if any database operation fails, or if a row cannot be converted between versions.
-    pub fn run_with<'a>(
+    pub async fn run_with<'a>(
         self,
         mk_connection: impl Fn(&str) -> <Backend as CrudBackend>::Connection<'a>,
     ) -> TymResult<(), Backend::Error> {
@@ -189,7 +189,7 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
         let destination_table_name = T::table_name();
         // Ensure the destination table exists
         {
-            T::create(mk_connection(destination_table_name))?;
+            T::create(mk_connection(destination_table_name)).await?;
         }
         while let Some(migration) = all.pop_front() {
             if all.is_empty() {
@@ -200,11 +200,9 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
             log::debug!("  checking {prev_table_name}");
             let fields = (migration.crud_fields)();
             // Get a cursor of each value in the prev table
-            let cursor = Backend::read_all_values(
-                (mk_connection)(prev_table_name),
-                prev_table_name,
-                fields,
-            )?;
+            let cursor =
+                Backend::read_all_values((mk_connection)(prev_table_name), prev_table_name, fields)
+                    .await?;
             let mut current_table_name = prev_table_name;
             let mut entries = 0;
             for res_prev in cursor {
@@ -234,7 +232,8 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
                         (mk_connection)(current_table_name),
                         current_table_name,
                         &fields,
-                    )?;
+                    )
+                    .await?;
                 }
             }
             log::debug!(
@@ -244,7 +243,7 @@ impl<T: Crud<Backend> + HasCrudFields + Clone + Sized + 'static, Backend: Migrat
             if current_table_name != prev_table_name {
                 log::debug!("    clearing out previous table {prev_table_name}");
                 let conn = (mk_connection)(prev_table_name);
-                Backend::delete_all(conn, prev_table_name)?;
+                Backend::delete_all(conn, prev_table_name).await?;
             }
         }
         Ok(())
